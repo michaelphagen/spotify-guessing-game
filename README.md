@@ -11,6 +11,7 @@ A pass-the-phone party game. Paste a Spotify playlist (or album or track) link. 
 - **Clip start:** from the beginning of the preview (default), or a random spot each song (0–15s in) so the intro alone isn't always the giveaway.
 - **No repeats:** a song is never played twice in a session. "Play again" can keep excluding songs you've already heard.
 - **Reloads are safe:** the game state lives in `sessionStorage`.
+- **Multiplayer rooms:** instead of passing one phone around, one device can host a room that everyone joins with their own phone (see [Multiplayer rooms](#multiplayer-rooms)).
 
 ## Run it
 
@@ -24,6 +25,35 @@ npm run snapshot     # refresh the bundled example playlist (see below)
 ```
 
 To play on phones on the same Wi-Fi network, open `http://<your-computer-ip>:3000`.
+
+## Multiplayer rooms
+
+Besides pass-the-phone (**Start game**), the setup screen has **Host a room** and **Join a room**. Rooms work on the static GitHub Pages site; no server of our own is involved.
+
+**Host (the “TV”).** Pick the playlist, answer mode, rounds and clip start as usual and press **Host a room**. The lobby shows a 4-letter room code (letters only, no I, L or O), a join link and a **Copy link** button, and lists players as they join. You can also add players who have no phone; they play on the host device when it's their turn. Press **Start game** once at least one player is in. The host device plays all the audio and shows the round, the answer and the scoreboard; the room code stays in the header. During any turn the host can press play, stop, “play next 10 seconds”, **Skip** (0 points) or **Next** itself, which helps when a phone is unresponsive.
+
+**Players.** Open the join link, or the site and then **Join a room**, and enter the code and your name. The phone shows a lobby, then the live scoreboard and “It's Alice's turn” while others play. On your own turn it shows a **Play** button (the song plays on the host device, not the phone), the answer options or text box, “Play next 10 seconds” once the first clip has finished, and **Reveal**, followed by the result. The clip's progress is mirrored on every phone. Nobody hears audio on their own phone, since everyone is in the same room.
+
+**Join link format:** `https://michaelphagen.github.io/spotify-guessing-game/?room=ABCD`, which is `<site url>?room=<CODE>`. The code is case-insensitive.
+
+**How it works.**
+
+- **Host-authoritative, peer to peer.** The host keeps the whole game (players, scores, the song queue) and checks every action (`play`, `stop`, `extend`, `answer`, `reveal`, `next`) against whose turn it is. Players only send actions and get back a snapshot made for them. A snapshot never holds the current song's title, artist, cover or preview URL until the turn is resolved. Multiple-choice options (four titles, with nothing marking the right one) go only to the player whose turn it is. The host also picks the random clip start and the options. The protocol and rules are in `public/lib/room.js` (pure, unit-tested); scoring, turns, options and answer matching reuse `public/game-logic.js`.
+- **Networking.** WebRTC data channels via [PeerJS](https://peerjs.com) **1.5.5** (vendored in `public/vendor/peerjs.min.js`, MIT license in `public/vendor/LICENSE-peerjs.txt`). PeerJS's **free public signaling server** (`0.peerjs.com`) introduces the devices to each other; it needs no account or key and is best-effort (no uptime guarantee). The host registers the peer id `gts-room-<CODE>` and phones connect to it. After that, game messages go directly between the devices (or through PeerJS's public TURN relay when a direct path isn't possible). To use your own PeerServer or TURN servers, set `PEERJS` in `public/config.js`. The transport is behind a small interface in `public/lib/transport.js` (`host`, `connect`, `send`, `onMessage`, `onPeerJoin`/`onPeerLeave`).
+- **Messages** are JSON objects with a protocol version `v`. Player to host: `hello {name, token}`, `play`, `stop`, `extend`, `answer {optionId | text}`, `reveal`, `next`. Host to player: `state {state}` (the player's snapshot), `playback {playback}` (the clip status and position, a few times a second while playing) and `error {code, message}`.
+- **Dropped connections.** A player who disconnects keeps their score and shows as offline. If it's their turn, the host can wait or skip them. Rejoining with the same name reclaims the slot, and so does the same phone, which keeps a player token in `localStorage`. New players can't join once the game has started. Both sides send keep-alives, so a phone that went to sleep is noticed within about 12 seconds.
+- **Host reloads.** The room, including the game, is saved in the host tab's `sessionStorage`. Reloading the host page reopens the room with the same code, and the phones reconnect automatically (they keep retrying for about a minute and show a “Host disconnected” screen meanwhile). If the host closes the room, or doesn't come back, the phones say so and offer a way back to setup.
+- **Errors** are shown instead of leaving a spinner: room not found, name already taken, game already started, host left, connection lost, and “Couldn't reach the PeerJS signaling server (0.peerjs.com)”.
+
+**Limits.**
+
+- The **host must keep the game tab open** and in the foreground. The game asks the browser to keep the screen awake where supported, but a host that sleeps or closes the tab drops everyone until it's back.
+- **Audio autoplay:** phones start songs remotely, so the host browser must allow playback. Pressing **Start game** on the host unlocks audio. If the browser still blocks it (for example after a reload), the host screen asks for one tap on play, and the phones say so.
+- **WebRTC can be blocked.** Corporate, school and some public Wi-Fi networks block peer-to-peer traffic or the signaling server. The TURN relay helps with strict NATs, but not with networks that block it outright. Joining then times out with an error. The simplest workaround is a phone hotspot.
+- The public signaling server is shared and rate limited, and it's run by the PeerJS project, not by this game. If it's down, rooms can't be created or joined, but pass-the-phone still works.
+- Up to 12 players per room.
+
+**Same-device dev mode:** add `?transport=local` to the URL (for example `http://localhost:3000/?transport=local`) and open the host and the players in **tabs of the same browser**. Messages then go over a `BroadcastChannel` instead of PeerJS, with no network needed. Join links made in this mode keep the parameter. The automated tests use this mode, and it's handy for development.
 
 ## Example playlist
 
@@ -134,12 +164,16 @@ public/
     spotify-url.js    link / URI parsing and validation (browser + server)
     embed-parser.js   __NEXT_DATA__ parser (browser + server)
     track-source.js   bundled example, backend detection, CORS-proxy fallback, cover lookup
+    room.js           multiplayer rooms: protocol, host-side rules, player snapshots, host/player controllers
+    transport.js      room networking: PeerTransport (PeerJS/WebRTC) and LocalTransport (BroadcastChannel)
+  vendor/
+    peerjs.min.js     PeerJS 1.5.5 (MIT, see LICENSE-peerjs.txt)
   game-logic.js   pure game rules (matching, options, turns, scoring), also used by tests
-  app.js          UI controller, clip player, sessionStorage persistence
+  app.js          UI controller (pass-the-phone, room host, room player), clip player, persistence
 scripts/
   snapshot-playlist.js   `npm run snapshot`: saves a playlist to public/data/example-playlist.json
 test/
-  *.test.js       node:test suites (URL parsing, parser, track source, example snapshot, game logic, HTTP API)
+  *.test.js       node:test suites (URL parsing, parser, track source, example snapshot, game logic, rooms, transport, HTTP API)
   fixtures/       captured embed pages (trimmed; session tokens removed)
 render.yaml       Render Blueprint for the optional backend
 .github/workflows/deploy.yml   GitHub Pages deployment

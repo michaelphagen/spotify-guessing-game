@@ -14,16 +14,21 @@
       <span class="brand-mark" aria-hidden="true">&#9835;</span>
       <span>Guess the Song</span>
     </div>
-    <button type="button" class="btn-link" id="end-game-btn" hidden>End game</button>
+    <div class="topbar-right">
+      <span class="room-chip" id="room-chip" hidden>Room <strong id="room-chip-code"></strong></span>
+      <button type="button" class="btn-link" id="end-game-btn" hidden>End game</button>
+      <button type="button" class="btn-link" id="leave-room-btn" hidden>Leave</button>
+    </div>
   </header>
 
+  <div id="conn-banner" class="conn-banner" role="status" hidden></div>
   <div id="scoreboard" class="scoreboard" aria-label="Scoreboard" hidden></div>
 
   <main id="app">
     <!-- SETUP -->
     <section id="screen-setup" class="screen" data-screen="setup">
       <h1>Name that tune in 5 seconds</h1>
-      <p class="lede">Paste a Spotify playlist, pass the phone around, and guess each song from its first five seconds.</p>
+      <p class="lede">Paste a Spotify playlist, pass the phone around (or play on everyone’s phones), and guess each song from its first five seconds.</p>
 
       <form id="setup-form" novalidate>
         <div class="field">
@@ -78,6 +83,12 @@
         <p id="setup-error" class="error" role="alert" hidden></p>
 
         <button type="submit" class="btn btn-primary btn-block" id="start-btn">Start game</button>
+        <p class="hint center">One phone, passed around. Or play with everyone’s own phone:</p>
+        <div class="room-actions">
+          <button type="button" class="btn btn-ghost" id="host-btn">Host a room</button>
+          <button type="button" class="btn btn-ghost" id="join-btn">Join a room</button>
+        </div>
+        <p class="hint">Host a room: this device is the “TV” and plays the songs; players join with a room code on their phones and answer there. (The player list above is for pass-the-phone only.)</p>
       </form>
 
       <details class="howto">
@@ -89,6 +100,112 @@
           <li>No song is played twice in a session.</li>
         </ul>
       </details>
+    </section>
+
+    <!-- JOIN A ROOM (player) -->
+    <section id="screen-join" class="screen" data-screen="join" hidden>
+      <h1>Join a room</h1>
+      <p class="lede">Enter the code shown on the host’s screen. The music plays on the host’s device; you answer here.</p>
+      <form id="join-form" novalidate>
+        <div class="field">
+          <label for="join-code">Room code</label>
+          <input id="join-code" class="code-input" type="text" maxlength="5" autocomplete="off" autocapitalize="characters"
+                 spellcheck="false" placeholder="ABCD" enterkeyhint="next">
+        </div>
+        <div class="field">
+          <label for="join-name">Your name</label>
+          <input id="join-name" type="text" maxlength="24" autocomplete="nickname" autocapitalize="words" placeholder="Your name" enterkeyhint="go">
+        </div>
+        <p id="join-error" class="error" role="alert" hidden></p>
+        <button type="submit" class="btn btn-primary btn-block" id="join-submit">Join</button>
+      </form>
+      <button type="button" class="btn-link" id="join-back">Back to setup</button>
+    </section>
+
+    <!-- HOST LOBBY -->
+    <section id="screen-lobby" class="screen" data-screen="lobby" hidden>
+      <div class="lobby-code">
+        <p class="turn-meta">Room code</p>
+        <p class="big-code" id="lobby-code"></p>
+        <p class="hint">On each phone, open this link (or this site, then “Join a room”):</p>
+        <div class="link-row">
+          <input id="lobby-link" type="text" readonly aria-label="Join link">
+          <button type="button" class="btn btn-ghost btn-small" id="copy-link-btn">Copy link</button>
+        </div>
+      </div>
+      <div id="lobby-conn" class="notice" role="status" hidden></div>
+      <p class="lede" id="lobby-source"></p>
+      <fieldset class="field">
+        <legend>Players (<span id="lobby-count">0</span>)</legend>
+        <ul id="lobby-players" class="lobby-players"></ul>
+        <p class="hint" id="lobby-empty">Waiting for players to join…</p>
+        <form id="local-form" class="free" autocomplete="off">
+          <label for="local-name" class="sr-only">Name of a player on this device</label>
+          <input id="local-name" type="text" maxlength="24" placeholder="Add a player without a phone" autocapitalize="words">
+          <button type="submit" class="btn btn-ghost">Add</button>
+        </form>
+        <p class="hint">Players without a phone play on this device when it’s their turn.</p>
+      </fieldset>
+      <p id="lobby-error" class="error" role="alert" hidden></p>
+      <button type="button" class="btn btn-primary btn-block" id="lobby-start" disabled>Start game</button>
+      <button type="button" class="btn-link" id="lobby-close">Close the room</button>
+    </section>
+
+    <!-- PLAYER: WAITING (connecting, lobby, other players' turns, errors) -->
+    <section id="screen-pwait" class="screen center" data-screen="pwait" hidden>
+      <div class="spinner" id="pw-spinner" aria-hidden="true"></div>
+      <p class="turn-meta" id="pw-meta"></p>
+      <h2 class="turn-player" id="pw-title"></h2>
+      <p class="lede" id="pw-sub"></p>
+      <div class="mini-clip" id="pw-clip" hidden>
+        <div class="clip-bar" aria-hidden="true">
+          <div class="clip-seg clip-seg-short"><div class="clip-fill" id="pw-fill-short"></div></div>
+          <div class="clip-seg clip-seg-long" id="pw-seg-long"><div class="clip-fill" id="pw-fill-long"></div></div>
+        </div>
+        <div class="clip-labels"><span id="pw-time">0.0s</span><span class="muted" id="pw-status"></span></div>
+      </div>
+      <div class="pw-actions" id="pw-actions" hidden>
+        <button type="button" class="btn btn-primary" id="pw-retry">Try again</button>
+        <a class="btn-link" id="pw-setup" href="./">Back to setup</a>
+      </div>
+    </section>
+
+    <!-- PLAYER: MY TURN -->
+    <section id="screen-pturn" class="screen" data-screen="pturn" hidden>
+      <div class="turn">
+        <p class="turn-meta" id="pt-meta"></p>
+        <h2 class="turn-player">Your turn</h2>
+      </div>
+      <div id="pt-notice" class="notice" role="status" hidden></div>
+      <div class="player-card">
+        <button type="button" class="play-btn" id="pt-play" aria-label="Play the first 5 seconds on the host’s device">
+          <svg class="icon-play" viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5v14l11-7z"/></svg>
+          <svg class="icon-stop" viewBox="0 0 24 24" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="1.5"/></svg>
+        </button>
+        <div class="clip">
+          <div class="clip-bar" aria-hidden="true">
+            <div class="clip-seg clip-seg-short"><div class="clip-fill" id="pt-fill-short"></div></div>
+            <div class="clip-seg clip-seg-long" id="pt-seg-long"><div class="clip-fill" id="pt-fill-long"></div></div>
+          </div>
+          <div class="clip-labels">
+            <span id="pt-time">0.0s</span>
+            <span class="muted" id="pt-status"></span>
+          </div>
+        </div>
+      </div>
+      <div class="row">
+        <button type="button" class="btn btn-ghost" id="pt-extend" disabled>Play next 10 seconds <span class="pill">5 pts</span></button>
+        <span class="worth" id="pt-worth"></span>
+      </div>
+      <div id="pt-choice" class="options" hidden></div>
+      <form id="pt-free" class="free" autocomplete="off" hidden>
+        <label for="pt-free-input" class="sr-only">Your guess</label>
+        <input id="pt-free-input" type="text" placeholder="Song title (optionally “title - artist”)" autocapitalize="off" spellcheck="false" enterkeyhint="done">
+        <button type="submit" class="btn btn-primary">Guess</button>
+      </form>
+      <div class="row row-end">
+        <button type="button" class="btn-link" id="pt-reveal">Reveal answer (0 pts)</button>
+      </div>
     </section>
 
     <!-- LOADING -->
@@ -105,6 +222,8 @@
       </div>
 
       <div id="notice" class="notice" role="status" hidden></div>
+
+      <p class="room-status" id="room-turn-status" hidden></p>
 
       <div class="player-card">
         <button type="button" class="play-btn" id="play-btn" aria-label="Play the first 5 seconds">
@@ -160,6 +279,7 @@
         </div>
       </div>
       <button type="button" class="btn btn-primary btn-block" id="next-btn">Next</button>
+      <p class="hint center" id="result-wait" hidden></p>
     </section>
 
     <!-- GAME OVER -->
@@ -175,6 +295,10 @@
         <button type="button" class="btn btn-primary btn-block" id="again-btn">Play again with this playlist</button>
         <button type="button" class="btn btn-ghost btn-block" id="new-btn">New playlist / players</button>
       </div>
+      <div class="over-actions" id="over-player" hidden>
+        <p class="hint center">Waiting for the host to start another game…</p>
+        <button type="button" class="btn btn-ghost btn-block" id="over-leave-btn">Leave the room</button>
+      </div>
     </section>
   </main>
 
@@ -185,6 +309,9 @@
   <script src="lib/embed-parser.js"></script>
   <script src="lib/track-source.js"></script>
   <script src="game-logic.js"></script>
+  <script src="vendor/peerjs.min.js"></script>
+  <script src="lib/transport.js"></script>
+  <script src="lib/room.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

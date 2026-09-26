@@ -53,4 +53,14 @@ window.GTS_CONFIG = {
    */
   EXAMPLE_URL: 'https://open.spotify.com/playlist/6i2Qd6OpeRBAzxfscNXeWp',
   EXAMPLE_SNAPSHOT: 'data/example-playlist.json',
+
+  /*
+   * Multiplayer rooms connect phones to the host with WebRTC (PeerJS). null
+   * uses PeerJS's free public signaling server (0.peerjs.com) and its default
+   * STUN/TURN servers. To use your own PeerServer or TURN, pass PeerJS options:
+   *   PEERJS: { host: 'peer.example.com', port: 443, path: '/', secure: true,
+   *             config: { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] } },
+   * Add ?transport=local to the URL to use tabs of one browser instead (testing).
+   */
+  PEERJS: null,
 };
