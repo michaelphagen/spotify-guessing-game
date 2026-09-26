@@ -1,0 +1,10 @@
+# Render Blueprint for the optional Node backend (it also serves the game itself).
+# In Render: New -> Blueprint, pick this repo.
+services:
+  - type: web
+    name: guess-the-song
+    runtime: node
+    plan: free
+    buildCommand: npm ci
+    startCommand: npm start
+    healthCheckPath: /api/health

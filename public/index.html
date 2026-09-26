@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0f1115">
+  <title>Guess the Song</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ccircle cx='50' cy='50' r='46' fill='%231ed760'/%3E%3Cpath d='M38 28v36a10 10 0 1 1-6-9V34l34-8v30a10 10 0 1 1-6-9V20z' fill='%230f1115'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true">&#9835;</span>
+      <span>Guess the Song</span>
+    </div>
+    <button type="button" class="btn-link" id="end-game-btn" hidden>End game</button>
+  </header>
+
+  <div id="scoreboard" class="scoreboard" aria-label="Scoreboard" hidden></div>
+
+  <main id="app">
+    <!-- SETUP -->
+    <section id="screen-setup" class="screen" data-screen="setup">
+      <h1>Name that tune in 5 seconds</h1>
+      <p class="lede">Paste a Spotify playlist, pass the phone around, and guess each song from its first five seconds.</p>
+
+      <form id="setup-form" novalidate>
+        <div class="field">
+          <label for="url-input">Spotify link</label>
+          <input id="url-input" name="url" type="url" inputmode="url" autocomplete="off" spellcheck="false"
+                 placeholder="https://open.spotify.com/playlist/..." required>
+          <p class="hint">Playlist, album or track link, or a <code>spotify:playlist:…</code> URI.
+            <button type="button" class="btn-link" id="example-btn">Use an example playlist</button></p>
+        </div>
+
+        <fieldset class="field">
+          <legend>Players</legend>
+          <ol id="player-list" class="player-list"></ol>
+          <button type="button" class="btn btn-ghost btn-small" id="add-player-btn">+ Add player</button>
+        </fieldset>
+
+        <fieldset class="field">
+          <legend>Answer mode</legend>
+          <div class="segmented" role="radiogroup">
+            <label><input type="radio" name="mode" value="choice" checked><span>Multiple choice</span></label>
+            <label><input type="radio" name="mode" value="free"><span>Free answer</span></label>
+          </div>
+        </fieldset>
+
+        <div class="field">
+          <label for="rounds-select">Rounds</label>
+          <select id="rounds-select" name="rounds">
+            <option value="1">1 round</option>
+            <option value="3">3 rounds</option>
+            <option value="5" selected>5 rounds</option>
+            <option value="10">10 rounds</option>
+            <option value="0">Until the songs run out</option>
+          </select>
+          <p class="hint">Each round, every player gets one song.</p>
+        </div>
+
+        <label class="check" id="exclude-wrap" hidden>
+          <input type="checkbox" id="exclude-used" checked>
+          <span>Skip songs already played this session (<span id="used-count">0</span> so far)</span>
+        </label>
+
+        <p id="setup-error" class="error" role="alert" hidden></p>
+
+        <button type="submit" class="btn btn-primary btn-block" id="start-btn">Start game</button>
+      </form>
+
+      <details class="howto">
+        <summary>How scoring works</summary>
+        <ul>
+          <li>Guess after the first <strong>5 seconds</strong>: <strong>10 points</strong>.</li>
+          <li>Need more? Play the <strong>next 10 seconds</strong>; a correct guess is then worth <strong>5 points</strong>.</li>
+          <li>Wrong answers and revealed answers score 0.</li>
+          <li>No song is played twice in a session.</li>
+        </ul>
+      </details>
+    </section>
+
+    <!-- LOADING -->
+    <section id="screen-loading" class="screen center" data-screen="loading" hidden>
+      <div class="spinner" aria-hidden="true"></div>
+      <p id="loading-text">Loading songs…</p>
+    </section>
+
+    <!-- ROUND -->
+    <section id="screen-round" class="screen" data-screen="round" hidden>
+      <div class="turn">
+        <p class="turn-meta" id="turn-meta"></p>
+        <h2 class="turn-player"><span id="turn-player"></span><span class="turn-suffix">’s turn</span></h2>
+      </div>
+
+      <div id="notice" class="notice" role="status" hidden></div>
+
+      <div class="player-card">
+        <button type="button" class="play-btn" id="play-btn" aria-label="Play the first 5 seconds">
+          <svg class="icon-play" viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5v14l11-7z"/></svg>
+          <svg class="icon-stop" viewBox="0 0 24 24" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="1.5"/></svg>
+        </button>
+        <div class="clip">
+          <div class="clip-bar" id="clip-bar" aria-hidden="true">
+            <div class="clip-seg clip-seg-short"><div class="clip-fill" id="fill-short"></div></div>
+            <div class="clip-seg clip-seg-long" id="seg-long"><div class="clip-fill" id="fill-long"></div></div>
+          </div>
+          <div class="clip-labels">
+            <span id="clip-time">0.0s</span>
+            <span class="muted" id="clip-status">Tap play to hear 5 seconds</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="row">
+        <button type="button" class="btn btn-ghost" id="extend-btn" disabled>Play next 10 seconds <span class="pill">5 pts</span></button>
+        <span class="worth" id="worth">Worth <strong>10</strong> points</span>
+      </div>
+
+      <div id="answer-choice" class="options" hidden></div>
+
+      <form id="answer-free" class="free" autocomplete="off" hidden>
+        <label for="free-input" class="sr-only">Your guess</label>
+        <input id="free-input" type="text" placeholder="Song title (optionally “title - artist”)" autocapitalize="off" spellcheck="false" enterkeyhint="done">
+        <button type="submit" class="btn btn-primary">Guess</button>
+      </form>
+
+      <div class="row row-end">
+        <button type="button" class="btn-link" id="skip-btn" hidden>Skip this song</button>
+        <button type="button" class="btn-link" id="reveal-btn">Reveal answer (0 pts)</button>
+      </div>
+    </section>
+
+    <!-- RESULT -->
+    <section id="screen-result" class="screen" data-screen="result" hidden>
+      <div class="verdict" id="verdict">
+        <p class="verdict-title" id="verdict-title"></p>
+        <p class="verdict-sub" id="verdict-sub"></p>
+      </div>
+      <div class="reveal">
+        <div class="cover" id="cover"><span aria-hidden="true">&#9835;</span></div>
+        <div class="reveal-text">
+          <p class="reveal-title" id="reveal-title"></p>
+          <p class="reveal-artist" id="reveal-artist"></p>
+          <div class="reveal-actions">
+            <button type="button" class="btn btn-ghost btn-small" id="listen-btn">Listen to the preview</button>
+            <a id="spotify-link" class="btn-link" target="_blank" rel="noopener noreferrer">Open in Spotify</a>
+          </div>
+        </div>
+      </div>
+      <button type="button" class="btn btn-primary btn-block" id="next-btn">Next</button>
+    </section>
+
+    <!-- GAME OVER -->
+    <section id="screen-over" class="screen" data-screen="over" hidden>
+      <h1 id="over-title">Final standings</h1>
+      <p class="lede" id="over-sub"></p>
+      <ol id="standings" class="standings"></ol>
+      <div class="over-actions">
+        <label class="check" id="again-exclude-wrap">
+          <input type="checkbox" id="again-exclude" checked>
+          <span>Don’t repeat songs we already heard</span>
+        </label>
+        <button type="button" class="btn btn-primary btn-block" id="again-btn">Play again with this playlist</button>
+        <button type="button" class="btn btn-ghost btn-block" id="new-btn">New playlist / players</button>
+      </div>
+    </section>
+  </main>
+
+  <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+
+  <script src="config.js"></script>
+  <script src="lib/spotify-url.js"></script>
+  <script src="lib/embed-parser.js"></script>
+  <script src="lib/track-source.js"></script>
+  <script src="game-logic.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
