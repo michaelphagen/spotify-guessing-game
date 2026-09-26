@@ -445,7 +445,7 @@ test('player controller: connects, stores the token, retries when the host disap
   }
   let nextFail = 'room-not-found';
   const player = Room.createPlayer({
-    code: 'ABCD', name: 'Alice', token: null, timers, retryMs: 1, maxRetries: 2,
+    code: 'ABCD', name: 'Alice', token: null, timers, retryMs: 1, maxRetries: 2, joinWaitMs: 0,
     makeTransport: () => { const t = fakePlayerTransport({ fail: nextFail }); made.push(t); return t; },
     hooks: { onStatus: (s, d) => statuses.push(s + (d ? ':' + d.code : '')), onState: (v) => states.push(v), onToken: (t) => tokens.push(t) },
   });
@@ -574,4 +574,277 @@ test('a finished clip is reported as a change, so a host reload keeps "play next
   hearClip(host);
   assert.ok(changes.includes('playback'));
   assert.equal(room.turn.playedOnce, true);
+});
+
+// ---------- Resilience: sync, saved rooms, rejoining, player retries ----------
+
+test('sync: a player asks for the current state again (after its tab was in the background)', () => {
+  const { room, transport, host } = setup({ names: ['Alice', 'Bob'] });
+  host.start();
+  transport.clear();
+  transport.deliver('peer2', act('sync'));
+  const replies = transport.to('peer2');
+  assert.equal(replies.length, 1, 'only the asking player gets a reply');
+  assert.equal(replies[0].type, 'state');
+  assert.equal(replies[0].state.phase, 'round');
+  assert.equal(replies[0].state.you.name, 'Bob');
+  assert.equal(transport.to('peer1').length, 0);
+  assert.equal(replies[0].state.turn.options, null, 'still no options for the waiting player');
+  // Not in the room (e.g. the host restarted): the player is asked to say hello again.
+  transport.deliver('stranger', act('sync'));
+  assert.equal(transport.last('stranger').code, 'not-joined');
+  assert.equal(room.players.length, 2);
+});
+
+test('saved room: full round trip through localStorage JSON (settings, tracks, tokens, scores, used songs, turn, options, progress)', () => {
+  const { room, transport, host } = setup({ rounds: 2 });
+  host.start();
+  hearClip(host); // 5 s heard: "play next 10 seconds" unlocked
+  transport.deliver(currentPeer(room), act('extend'));
+  host.playback({ status: 'playing', pos: 7, from: 5, to: 15 }); // the host's tab is closed mid-clip
+  const entry = Room.savedRoomEntry(room, { now: 1000, transport: 'peer', owner: 'tab1', claimedAt: 900 });
+  const json = JSON.parse(JSON.stringify(entry));
+  const r = Room.restoreRoom(json, { now: 1000 + 60 * 60 * 1000, transport: 'peer' });
+  assert.ok(r);
+  assert.equal(r.code, 'ABCD');
+  assert.deepEqual(r.settings, room.settings);
+  assert.deepEqual(r.tracks, room.tracks, 'the track list is saved: resuming needs no playlist fetch');
+  assert.deepEqual(r.game.tracks, room.game.tracks);
+  assert.deepEqual(r.usedIds, room.usedIds);
+  assert.deepEqual(r.players.map((p) => [p.id, p.name, p.token]), room.players.map((p) => [p.id, p.name, p.token]));
+  assert.ok(r.players.every((p) => p.online === false && p.peerId === null), 'phones must reconnect');
+  assert.equal(r.game.current.trackId, room.game.current.trackId);
+  assert.equal(r.game.current.clipStart, room.game.current.clipStart);
+  assert.deepEqual(r.game.current.options, room.game.current.options);
+  assert.equal(r.game.current.extended, true);
+  assert.equal(r.turn.heard, 7);
+  assert.equal(r.playback.status, 'idle', 'the clip that was playing is stopped');
+  assert.equal(r.playback.heard, 7);
+
+  // Resumed: players reclaim their slots with their tokens and get the full state.
+  const t2 = fakeTransport();
+  const host2 = Room.createHost({ room: r, transport: t2, rng: seeded(3) });
+  t2.deliver('alice-new-peer', hello('Alice', room.players[0].token));
+  t2.deliver('bob-new-peer', hello('Bob', room.players[1].token));
+  assert.equal(r.players.length, 2);
+  const v = t2.last('alice-new-peer', 'state').state;
+  assert.equal(v.you.id, room.players[0].id);
+  assert.equal(v.turn.extended, true);
+  assert.equal(v.turn.playedOnce, true);
+  assert.equal(v.playback.heard, 7);
+  assert.ok(host2.act('reveal').ok);
+  assert.ok(host2.act('next').ok);
+
+  // Too old, other transport, other version, broken: not resumable.
+  assert.equal(Room.restoreRoom(JSON.parse(JSON.stringify(entry)), { now: 1000 + Room.RESUME_MAX_AGE_MS }), null);
+  assert.equal(Room.restoreRoom(JSON.parse(JSON.stringify(entry)), { now: 2000, transport: 'local' }), null);
+  assert.equal(Room.restoreRoom({ ...json, v: 99 }, { now: 2000 }), null);
+  assert.equal(Room.restoreRoom({ ...json, savedAt: undefined }, { now: 2000 }), null);
+  assert.equal(Room.restoreRoom({ ...json, room: { ...json.room, tracks: [] } }, { now: 2000 }), null);
+  assert.equal(Room.restoreRoom(null), null);
+  // Damaged entries (hand-edited storage, an older build) are skipped, not thrown on.
+  const damaged = [
+    { ...json.room, players: [null] },
+    { ...json.room, players: [{ id: 'x' }] },
+    { ...json.room, tracks: [null] },
+    { ...json.room, settings: null },
+    { ...json.room, game: 5 },
+    'not a room',
+  ];
+  damaged.forEach((d) => {
+    const e = { ...json, room: d };
+    assert.equal(Room.restoreRoom(e, { now: 2000 }), null);
+    assert.equal(Room.pickResumableRoom([e], { now: 2000 }), null);
+  });
+  // The bare room from sessionStorage (a reload) has no timestamp and is accepted.
+  assert.ok(Room.restoreRoom(JSON.parse(JSON.stringify(room))));
+});
+
+test('pickResumableRoom: the newest saved room that can still be resumed', () => {
+  const { room } = setup();
+  const mk = (code, savedAt, transport = 'peer') => JSON.parse(JSON.stringify(Room.savedRoomEntry({ ...room, code }, { now: savedAt, transport })));
+  const now = 10 * 60 * 60 * 1000;
+  const list = [mk('AAAA', now - 1000), mk('BBBB', now - 500), mk('CCCC', now - 100, 'local'), mk('DDDD', -Room.RESUME_MAX_AGE_MS), null, { junk: 1 }];
+  assert.equal(Room.pickResumableRoom(list, { now, transport: 'peer' }).room.code, 'BBBB');
+  assert.equal(Room.pickResumableRoom(list, { now, transport: 'local' }).room.code, 'CCCC');
+  assert.equal(Room.pickResumableRoom([], { now }), null);
+});
+
+test('rejoinDecision: when a player page rejoins by itself, shows the form, or offers "Rejoin"', () => {
+  const now = 5 * 60 * 60 * 1000;
+  const saved = (o = {}) => Room.savedJoinEntry({ code: 'WXYZ', name: 'Alice', token: 'tok', left: false, ...o }, { now: now - 60000, transport: 'peer' });
+  const d = (o) => Room.rejoinDecision({ urlCode: '', sessionJoin: null, savedJoin: null, transport: 'peer', now, ...o });
+
+  // The join link for the saved room: straight back in, with the token.
+  assert.deepEqual(d({ urlCode: 'WXYZ', savedJoin: saved() }), { action: 'rejoin', code: 'WXYZ', name: 'Alice', token: 'tok', source: 'saved' });
+  // A reload of this tab (sessionStorage) always rejoins.
+  assert.equal(d({ urlCode: 'WXYZ', sessionJoin: { code: 'WXYZ', name: 'Bob' } }).source, 'session');
+  assert.deepEqual(d({ sessionJoin: { code: 'WXYZ', name: 'Alice' }, savedJoin: saved() }),
+    { action: 'rejoin', code: 'WXYZ', name: 'Alice', token: 'tok', source: 'session' });
+  // Opening the site within 12 hours of playing: rejoin.
+  assert.equal(d({ savedJoin: saved() }).action, 'rejoin');
+  // Another room's link: the form (no name guessed from another room).
+  assert.deepEqual(d({ urlCode: 'ABCD', savedJoin: saved() }), { action: 'form', code: 'ABCD', name: '' });
+  // Pressed "Leave": no automatic rejoin; the form for its link is prefilled, setup offers "Rejoin".
+  assert.deepEqual(d({ urlCode: 'WXYZ', savedJoin: saved({ left: true }) }), { action: 'form', code: 'WXYZ', name: 'Alice' });
+  assert.equal(d({ savedJoin: saved({ left: true }) }).action, 'none');
+  assert.equal(d({ savedJoin: saved({ left: true }) }).offer.code, 'WXYZ');
+  // Older than 12 hours, another transport, or junk: nothing.
+  const old = Room.savedJoinEntry({ code: 'WXYZ', name: 'Alice' }, { now: now - Room.RESUME_MAX_AGE_MS - 1, transport: 'peer' });
+  assert.deepEqual(d({ savedJoin: old }), { action: 'none', offer: null });
+  assert.deepEqual(d({ savedJoin: saved(), transport: 'local' }), { action: 'none', offer: null });
+  assert.deepEqual(d({ savedJoin: { kind: 'gts-join', v: 1, code: '??', name: '', savedAt: now } }), { action: 'none', offer: null });
+  assert.deepEqual(d({ sessionJoin: { code: 'WXYZ', name: '  ' } }), { action: 'none', offer: null });
+});
+
+/** Scriptable stand-in for a player's transport. */
+function scriptedPlayerTransport(plan) {
+  const h = { message: [], leave: [] };
+  const t = {
+    sent: [],
+    wakes: [],
+    onMessage: (fn) => h.message.push(fn),
+    onPeerLeave: (fn) => h.leave.push(fn),
+    connect: () => (plan.fail ? Promise.reject(Object.assign(new Error(plan.fail), { code: plan.fail })) : Promise.resolve()),
+    send: (to, m) => t.sent.push(m),
+    close: () => { t.closed = true; },
+    wake: (info) => t.wakes.push(info),
+    fromHost: (m) => h.message.forEach((fn) => fn('host', m)),
+    hostLeft: () => h.leave.forEach((fn) => fn('host')),
+  };
+  return t;
+}
+
+function scriptedPlayer(opts) {
+  const statuses = [];
+  const made = [];
+  const timers = [];
+  let clock = 0;
+  const plan = { fail: null };
+  const ctl = Room.createPlayer({
+    code: 'ABCD', name: 'Alice', token: 'tok1',
+    now: () => clock,
+    timers: {
+      setTimeout: (fn, ms) => { timers.push({ fn, at: clock + ms, ms }); return timers.length; },
+      clearTimeout: (id) => { if (id && timers[id - 1]) timers[id - 1].cancelled = true; },
+    },
+    makeTransport: () => { const t = scriptedPlayerTransport({ ...plan }); made.push(t); return t; },
+    hooks: { onStatus: (s, d) => statuses.push(s + (d && d.code ? ':' + d.code : '')) },
+    ...opts,
+  });
+  const flush = () => new Promise((r) => setImmediate(r));
+  const pending = () => timers.filter((x) => !x.cancelled && !x.done);
+  /** Advance the clock to the next timer and run it. */
+  async function next() {
+    const n = pending().sort((a, b) => a.at - b.at)[0];
+    assert.ok(n, 'a timer is pending');
+    clock = Math.max(clock, n.at);
+    n.done = true;
+    n.fn();
+    await flush();
+    return n.ms;
+  }
+  const state = (phase = 'lobby') => ({ v: 1, type: 'state', state: { phase, you: { id: 'p1', name: 'Alice', token: 'tok1' } } });
+  return { ctl, statuses, made, plan, next, flush, pending, state, tick: (ms) => { clock += ms; } };
+}
+
+test('player: joining keeps trying while the host is away (waiting), tells its own network apart, and gives up after joinWaitMs', async () => {
+  const p = scriptedPlayer({ joinRetryMs: 4000, joinWaitMs: 180000 });
+  p.plan.fail = 'room-not-found'; // the host's page is in the background: its id isn't registered
+  p.ctl.start();
+  await p.flush();
+  assert.deepEqual(p.statuses, ['connecting', 'waiting:room-not-found']);
+  p.plan.fail = 'timeout'; // registered but not answering (frozen tab)
+  assert.equal(await p.next(), 4000);
+  assert.equal(p.statuses.at(-1), 'waiting:timeout');
+  p.plan.fail = 'signaling-unreachable'; // this phone's own network
+  await p.next();
+  assert.equal(p.statuses.at(-1), 'waiting:signaling-unreachable');
+  // The host's screen comes back: the next attempt joins without anyone pressing anything.
+  p.plan.fail = null;
+  await p.next();
+  const t = p.made.at(-1);
+  assert.deepEqual(t.sent[0], { v: 1, type: 'hello', name: 'Alice', token: 'tok1' });
+  t.fromHost(p.state());
+  assert.equal(p.ctl.status(), 'connected');
+  assert.ok(!p.statuses.includes('connecting', 1), 'no flicker back to "connecting" between tries');
+
+  // Never answers: fails after joinWaitMs, with the last reason.
+  const q = scriptedPlayer({ joinRetryMs: 4000, joinWaitMs: 20000 });
+  q.plan.fail = 'timeout';
+  q.ctl.start();
+  await q.flush();
+  for (let i = 0; i < 5; i++) await q.next();
+  assert.equal(q.statuses.at(-1), 'failed:timeout');
+  assert.equal(q.pending().length, 0);
+  // A browser without WebRTC fails at once.
+  const w = scriptedPlayer({});
+  w.plan.fail = 'webrtc-unsupported';
+  w.ctl.start();
+  await w.flush();
+  assert.equal(w.statuses.at(-1), 'failed:webrtc-unsupported');
+});
+
+test('player: after a drop it retries forever with backoff capped at 10 s, at once on wake, and only "closed" ends it', async () => {
+  const p = scriptedPlayer({});
+  p.ctl.start();
+  await p.flush();
+  p.made[0].fromHost(p.state('round'));
+  p.made[0].hostLeft();
+  assert.equal(p.statuses.at(-1), 'reconnecting:host-left');
+  p.plan.fail = 'room-not-found';
+  const delays = [];
+  for (let i = 0; i < 40; i++) delays.push(await p.next()); // ~6 minutes of the host being away
+  assert.deepEqual(delays.slice(0, 6), [1000, 2000, 4000, 8000, 10000, 10000]);
+  assert.ok(delays.every((d) => d <= 10000));
+  assert.equal(p.ctl.status(), 'reconnecting', 'never gives up by itself');
+  assert.ok(!p.statuses.some((s) => s.startsWith('failed')));
+
+  // The player's own tab comes back to the foreground: retry now, not in 10 s.
+  p.plan.fail = null;
+  const before = p.made.length;
+  p.ctl.wake({ resumed: true });
+  await p.flush();
+  assert.equal(p.made.length, before + 1, 'a new attempt right away');
+  p.made.at(-1).fromHost(p.state('round'));
+  assert.equal(p.ctl.status(), 'connected');
+  assert.equal(p.pending().length, 0, 'the scheduled retry was cancelled');
+
+  // The host closes the room on purpose: that ends it.
+  p.made.at(-1).fromHost({ v: 1, type: 'error', code: 'closed', message: 'The host closed the room.' });
+  assert.equal(p.statuses.at(-1), 'failed:closed');
+  assert.equal(p.pending().length, 0);
+});
+
+test('player: wake() while connected asks for a fresh state; no answer means a dead connection; not-joined re-sends hello', async () => {
+  const p = scriptedPlayer({ replyTimeoutMs: 5000 });
+  p.ctl.start();
+  await p.flush();
+  const t = p.made[0];
+  t.fromHost(p.state('round'));
+  // Back from the background: the transport restarts its keep-alive clocks and the host is asked for the state.
+  p.ctl.wake({ resumed: true });
+  assert.deepEqual(t.wakes, [{ resumed: true }]);
+  assert.deepEqual(t.sent.at(-1), { v: 1, type: 'sync' });
+  t.fromHost(p.state('result'));
+  assert.equal(p.ctl.view().phase, 'result');
+  assert.equal(p.pending().filter((x) => x.ms === 5000).length, 0, 'the answer cancels the reply timeout');
+  // The host doesn't know us any more (it restarted, or marked us offline): say hello again.
+  t.fromHost({ v: 1, type: 'error', code: 'not-joined', message: 'Join the room first.' });
+  assert.equal(t.sent.at(-1).type, 'hello');
+  assert.equal(p.ctl.status(), 'connected');
+  // The connection looks open but the host never answers: reconnect.
+  p.ctl.wake({ resumed: true });
+  const n = p.made.length;
+  await p.next(); // the reply timeout
+  assert.equal(p.statuses.at(-1), 'reconnecting:host-left');
+  await p.next(); // the retry
+  assert.equal(p.made.length, n + 1);
+  // Waking while an attempt is under way doesn't start another one.
+  p.ctl.wake({});
+  assert.equal(p.made.length, n + 1);
+  p.ctl.leave();
+  assert.equal(p.ctl.status(), 'left');
+  p.ctl.wake({});
+  assert.equal(p.made.length, n + 1);
 });

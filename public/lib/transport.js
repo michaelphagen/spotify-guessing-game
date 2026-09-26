@@ -8,6 +8,10 @@
  *   t.send(peerId, msg)              msg is a JSON-serialisable object
  *   t.onMessage(fn(peerId, msg)), t.onPeerJoin(fn(peerId)), t.onPeerLeave(fn(peerId)),
  *   t.onError(fn(err))               errors after the connection was set up
+ *   t.onStatus(fn(status)), t.status()   'connected' | 'reconnecting' | 'offline'
+ *   t.wake({resumed})                the page is visible/online again (resumed: it was
+ *                                    hidden or frozen); the host re-registers the room
+ *                                    with the signaling server if needed
  *   t.close()
  *
  * Rejections and onError carry an Error with a `code`:
@@ -26,7 +30,9 @@
  *
  * Both send a small keep-alive every few seconds; a peer that is silent for
  * longer than `timeoutMs` counts as gone (WebRTC can take much longer than that
- * to notice a phone that locked its screen or lost Wi-Fi).
+ * to notice a phone that locked its screen or lost Wi-Fi). While this page is
+ * hidden nobody is timed out (its own timers may be frozen), and after it comes
+ * back every peer gets a grace period (see base()).
  */
 (function (root, factory) {
   if (typeof module === 'object' && module.exports) module.exports = factory();
@@ -57,37 +63,66 @@
     return 'p' + Math.random().toString(36).slice(2, 10) + Date.now().toString(36).slice(-4);
   }
 
-  /** Event plumbing + keep-alive shared by both implementations. */
+  /**
+   * Event plumbing, connection status and keep-alive shared by both implementations.
+   *
+   * Keep-alive and hidden pages: mobile browsers throttle or freeze the timers
+   * of a background tab, so while this page is hidden (or right after its
+   * timers stalled) its own clock says nothing about its peers. Nobody is timed
+   * out while the page is hidden, and when it is visible again every peer's
+   * "last seen" is reset and gets a grace period of 2x the timeout.
+   */
   function base(opts) {
     opts = opts || {};
-    var handlers = { message: [], join: [], leave: [], error: [] };
+    var handlers = { message: [], join: [], leave: [], error: [], status: [] };
     var lastSeen = {};
     var kaTimer = null;
     var interval = opts.keepAliveMs || 3000;
     var timeout = opts.timeoutMs || 12000;
+    var now = opts.now || function () { return Date.now(); };
+    var isHidden = opts.isHidden || function () { return typeof document !== 'undefined' && !!document.hidden; };
+    var graceUntil = 0;
+    var wasHidden = false;
+    var status = 'idle';
     var self = {
       handlers: handlers,
+      now: now,
       emit: function (kind) {
         var args = Array.prototype.slice.call(arguments, 1);
         handlers[kind].slice().forEach(function (fn) {
           try { fn.apply(null, args); } catch (e) { if (typeof console !== 'undefined') console.error(e); }
         });
       },
-      seen: function (peerId) { lastSeen[peerId] = Date.now(); },
+      /** 'idle' | 'connected' | 'reconnecting' | 'offline' (signaling / channel status). */
+      setStatus: function (s, err) {
+        if (s === status) return;
+        status = s;
+        self.emit('status', s, err || null);
+      },
+      seen: function (peerId) { lastSeen[peerId] = now(); },
       forget: function (peerId) { delete lastSeen[peerId]; },
+      /** This page was hidden or frozen: don't hold its own silence against anyone. */
+      resume: function () {
+        var t = now();
+        Object.keys(lastSeen).forEach(function (id) { lastSeen[id] = t; });
+        graceUntil = t + timeout * 2;
+      },
       /** Start keep-alives: sendKa(peerId) for every tracked peer; onTimeout(peerId) when silent. */
       startKeepAlive: function (sendKa, onTimeout) {
         clearInterval(kaTimer);
-        var lastTick = Date.now();
+        var lastTick = now();
         kaTimer = setInterval(function () {
-          var t = Date.now();
+          var t = now();
           // This tab was frozen or too busy to run timers: messages that arrived
           // meanwhile may not have been handled yet, so the silence could be ours.
-          // Don't time anyone out on this tick; the next one decides.
           var stalled = t - lastTick > Math.max(interval * 2, timeout / 2);
           lastTick = t;
+          var hidden = isHidden();
+          if (hidden) wasHidden = true;
+          else if (wasHidden || stalled) { wasHidden = false; self.resume(); }
+          var mayDrop = !hidden && !stalled && t >= graceUntil;
           Object.keys(lastSeen).forEach(function (id) {
-            if (!stalled && t - lastSeen[id] > timeout) { delete lastSeen[id]; onTimeout(id); return; }
+            if (mayDrop && t - lastSeen[id] > timeout) { delete lastSeen[id]; onTimeout(id); return; }
             try { sendKa(id); } catch (e) { /* ignore */ }
           });
         }, interval);
@@ -99,6 +134,8 @@
         onPeerJoin: function (fn) { handlers.join.push(fn); },
         onPeerLeave: function (fn) { handlers.leave.push(fn); },
         onError: function (fn) { handlers.error.push(fn); },
+        onStatus: function (fn) { handlers.status.push(fn); },
+        status: function () { return status; },
       },
     };
     return self;
@@ -184,6 +221,7 @@
             else if (env.k === 'bye') dropPeer(pid);
           };
           b.startKeepAlive(function (pid) { post('ka', pid); }, dropPeer);
+          b.setStatus('connected');
           resolve();
         }, opts.probeMs || 250);
       });
@@ -201,6 +239,7 @@
               hostId = env.from;
               b.seen('host');
               b.startKeepAlive(function () { post('ka', hostId); }, function () { hostId = null; b.emit('leave', 'host'); });
+              b.setStatus('connected');
               resolve();
               return;
             }
@@ -227,6 +266,11 @@
         if (!peers[to]) return;
         post('msg', to, msg);
       }
+    };
+
+    /** The page is back (visible, online, ...). `info.resumed`: it was hidden or frozen. */
+    api.wake = function (info) {
+      if (info && info.resumed) b.resume();
     };
 
     api.close = function () {
@@ -259,27 +303,60 @@
   /**
    * @param {object} [opts] { Peer (constructor, default window.Peer), peerOptions
    *   (host/port/path/key/config for your own PeerServer or TURN), connectTimeoutMs,
-   *   keepAliveMs, timeoutMs }
+   *   keepAliveMs, timeoutMs, isHidden, now,
+   *   signalingRetryMs (first delay before reconnecting to the signaling server, 500),
+   *   signalingRetryMaxMs (backoff cap, 15000), reopenTimeoutMs (how long a
+   *   reconnect may take before it is aborted and retried, 10000), idRetryForMs (how
+   *   long to keep retrying while the server still holds the room's id, 30000) }
+   *
+   * Host signaling supervisor: mobile browsers close the signaling WebSocket of
+   * a background tab, and PeerJS then leaves the Peer `disconnected` (or
+   * destroyed). Nobody can join until it is registered again, so the host
+   * reconnects on its own: on 'disconnected' / 'close' / signaling errors (with
+   * backoff) and at once on wake() (the page is visible or online again). A
+   * disconnected Peer gets peer.reconnect() (a reconnect that doesn't open in
+   * time is aborted and retried); a destroyed one is replaced by a new Peer with
+   * the same id and token.
+   * The server can still hold the old registration for a while ('unavailable-id'):
+   * that is retried for `idRetryForMs` before an error is reported.
+   * Status (onStatus): 'connected' | 'reconnecting' | 'offline' (gave up; wake() retries).
    */
   function PeerTransport(opts) {
     opts = opts || {};
     var PeerCtor = opts.Peer || (typeof window !== 'undefined' ? window.Peer : null);
     var b = base(opts);
+    var now = b.now;
     var peer = null;
     var conns = {}; // peerId -> DataConnection
     var hostConn = null;
     var closed = false;
     var connectTimeout = opts.connectTimeoutMs || 15000;
     var peerOptions = Object.assign({ debug: 0 }, opts.peerOptions || {});
+    var retryBase = opts.signalingRetryMs || 500;
+    var retryMax = opts.signalingRetryMaxMs || 15000;
+    var reopenTimeout = opts.reopenTimeoutMs || 10000;
+    var idRetryFor = opts.idRetryForMs || 30000;
+    // Host signaling supervisor state.
+    var hostId = null;
+    var started = false; // the room opened once: from now on, keep it registered
+    var sigTimer = null;
+    var sigDelay = 0;
+    var openWait = null;
+    var idTakenSince = 0;
+    var gaveUp = false;
+
+    // The host's Peers share one token: the signaling server lets a new Peer
+    // with the same id AND token take over a registration it still holds
+    // (otherwise it answers 'unavailable-id' until the old one times out).
+    var hostToken = peerOptions.token || Math.random().toString(36).slice(2);
 
     function makePeer(id) {
       if (!PeerCtor) throw transportError('transport', 'The PeerJS library didn’t load (vendor/peerjs.min.js).');
       if (typeof RTCPeerConnection === 'undefined') throw transportError('webrtc-unsupported');
-      return id ? new PeerCtor(id, peerOptions) : new PeerCtor(peerOptions);
+      return id ? new PeerCtor(id, Object.assign({}, peerOptions, { token: hostToken })) : new PeerCtor(peerOptions);
     }
 
-    // The signaling socket can drop (sleeping laptop, flaky Wi-Fi). Open data
-    // connections keep working; reconnect so new players can still join.
+    // A player's signaling socket can drop too; its data connection keeps working.
     function keepSignaling(p) {
       p.on('disconnected', function () {
         if (closed || p.destroyed) return;
@@ -313,23 +390,122 @@
       return end;
     }
 
-    var api = b.api;
+    // ---- Host: signaling supervisor ----
 
-    api.host = function (roomId) {
-      return new Promise(function (resolve, reject) {
-        var settled = false;
-        try { peer = makePeer(PEER_PREFIX + roomId); } catch (e) { reject(e); return; }
-        var timer = setTimeout(function () {
-          if (settled) return;
-          settled = true;
-          reject(transportError('signaling-unreachable'));
-          try { peer.destroy(); } catch (e) { /* ignore */ }
-        }, connectTimeout);
-        peer.on('open', function () {
-          if (settled) return;
-          settled = true;
-          clearTimeout(timer);
-          keepSignaling(peer);
+    function peerIsUp(p) { return !!(p && p.open && !p.disconnected && !p.destroyed); }
+
+    function clearSigTimers() {
+      clearTimeout(sigTimer);
+      clearTimeout(openWait);
+      sigTimer = null;
+      openWait = null;
+    }
+
+    function sigConnected() {
+      clearSigTimers();
+      sigDelay = 0;
+      idTakenSince = 0;
+      gaveUp = false;
+      b.setStatus('connected');
+    }
+
+    /** Try again after a backoff delay (unless a try is already scheduled). */
+    function scheduleSignaling() {
+      if (closed || !started || gaveUp) return;
+      b.setStatus('reconnecting');
+      if (sigTimer) return;
+      sigDelay = sigDelay ? Math.min(sigDelay * 2, retryMax) : retryBase;
+      sigTimer = setTimeout(function () { sigTimer = null; ensureSignaling(); }, sigDelay);
+    }
+
+    /** Get the room's id registered with the signaling server again. */
+    function ensureSignaling() {
+      if (closed || !started || gaveUp) return;
+      if (peerIsUp(peer)) { sigConnected(); return; }
+      if (!peer || peer.destroyed) { recreatePeer(); return; }
+      b.setStatus('reconnecting');
+      if (peer.disconnected) {
+        try { peer.reconnect(); } catch (e) { recreatePeer(); return; }
+      }
+      awaitOpen();
+    }
+
+    /**
+     * The reconnect (or new Peer) must open in time; otherwise abort it and try
+     * again. The Peer itself is kept (unless it was destroyed): destroying it
+     * would also close the players' data connections, which work fine without
+     * the signaling server.
+     */
+    function awaitOpen() {
+      clearTimeout(openWait);
+      var p = peer;
+      openWait = setTimeout(function () {
+        openWait = null;
+        if (closed || p !== peer || peerIsUp(p)) return;
+        if (p.destroyed) peer = null; // the next try makes a new one with the same id
+        else if (!p.disconnected) {
+          // A hanging attempt: close its socket, so the next try can call reconnect().
+          try { p.disconnect(); } catch (e) { peer = null; try { p.destroy(); } catch (x) { /* ignore */ } }
+        }
+        scheduleSignaling();
+      }, reopenTimeout);
+    }
+
+    function recreatePeer() {
+      var old = peer;
+      peer = null;
+      // The old Peer's data connections close with it; players reconnect on their own.
+      if (old && !old.destroyed) { try { old.destroy(); } catch (e) { /* ignore */ } }
+      var p;
+      try { p = makePeer(hostId); } catch (e) { scheduleSignaling(); return; }
+      peer = p;
+      b.setStatus('reconnecting');
+      attachHostPeer(p, null);
+      awaitOpen();
+    }
+
+    function noteIdTaken() {
+      if (!idTakenSince) idTakenSince = now();
+      if (now() - idTakenSince >= idRetryFor) {
+        // Someone else really holds the room's id (another tab or device hosting it?).
+        gaveUp = true;
+        clearSigTimers();
+        idTakenSince = 0;
+        b.setStatus('offline');
+        b.emit('error', transportError('room-taken', 'Another tab or device is hosting this room code now.'));
+        return;
+      }
+      scheduleSignaling();
+    }
+
+    function onHostConnection(conn) {
+      var pid = conn.peer;
+      conn.on('open', function () {
+        var old = conns[pid];
+        conns[pid] = conn;
+        b.seen(pid);
+        if (old && old !== conn) { try { old.close(); } catch (e) { /* ignore */ } }
+        wire(conn, pid, function () {
+          if (conns[pid] !== conn) return;
+          delete conns[pid];
+          b.forget(pid);
+          b.emit('leave', pid);
+        });
+        b.emit('join', pid);
+      });
+    }
+
+    /**
+     * Events of a host Peer (the first one, or a replacement). `first` settles
+     * host()'s promise: {resolve, reject, timer, settled}.
+     */
+    function attachHostPeer(p, first) {
+      p.on('open', function () {
+        if (closed || p !== peer) return;
+        if (first && !first.settled) {
+          first.settled = true;
+          clearTimeout(first.timer);
+          started = true;
           b.startKeepAlive(function (pid) {
             var c = conns[pid];
             if (c && c.open) { var m = {}; m[KA] = 1; c.send(m); }
@@ -338,37 +514,71 @@
             if (c) { try { c.close(); } catch (e) { /* ignore */ } }
             if (conns[pid]) { delete conns[pid]; b.emit('leave', pid); }
           });
-          resolve();
-        });
-        peer.on('error', function (err) {
-          var e = mapPeerError(err);
-          if (!settled) {
-            settled = true;
-            clearTimeout(timer);
-            try { peer.destroy(); } catch (x) { /* ignore */ }
-            reject(e);
-            return;
-          }
-          if (e.code === 'room-not-found') return; // a player that already left
-          b.emit('error', e);
-        });
-        peer.on('connection', function (conn) {
-          var pid = conn.peer;
-          conn.on('open', function () {
-            var old = conns[pid];
-            conns[pid] = conn;
-            b.seen(pid);
-            if (old && old !== conn) { try { old.close(); } catch (e) { /* ignore */ } }
-            wire(conn, pid, function () {
-              if (conns[pid] !== conn) return;
-              delete conns[pid];
-              b.forget(pid);
-              b.emit('leave', pid);
-            });
-            b.emit('join', pid);
-          });
-        });
+          sigConnected();
+          first.resolve();
+          return;
+        }
+        sigConnected();
       });
+      p.on('error', function (err) {
+        if (closed || p !== peer) return;
+        var e = mapPeerError(err);
+        if (first && !first.settled) {
+          first.settled = true;
+          clearTimeout(first.timer);
+          peer = null;
+          try { p.destroy(); } catch (x) { /* ignore */ }
+          first.reject(e);
+          return;
+        }
+        if (e.code === 'room-not-found') return; // a player that already left
+        if (e.code === 'room-taken') { noteIdTaken(); return; }
+        if (e.code === 'signaling-unreachable') { scheduleSignaling(); return; }
+        b.emit('error', e);
+      });
+      p.on('disconnected', function () { if (!closed && p === peer) scheduleSignaling(); });
+      p.on('close', function () { if (!closed && p === peer) scheduleSignaling(); });
+      p.on('connection', onHostConnection);
+    }
+
+    var api = b.api;
+
+    api.host = function (roomId) {
+      hostId = PEER_PREFIX + roomId;
+      return new Promise(function (resolve, reject) {
+        var first = { resolve: resolve, reject: reject, settled: false, timer: null };
+        var p;
+        try { p = makePeer(hostId); } catch (e) { reject(e); return; }
+        peer = p;
+        first.timer = setTimeout(function () {
+          if (first.settled) return;
+          first.settled = true;
+          peer = null;
+          reject(transportError('signaling-unreachable'));
+          try { p.destroy(); } catch (e) { /* ignore */ }
+        }, connectTimeout);
+        attachHostPeer(p, first);
+      });
+    };
+
+    /**
+     * The page is back (visible, pageshow, focus, online). Host: make sure the
+     * room is registered with the signaling server (retrying at once, and again
+     * after an 'offline' give-up). `info.resumed`: the page was hidden or frozen,
+     * so keep-alive clocks restart with a grace period.
+     */
+    api.wake = function (info) {
+      if (info && info.resumed) b.resume();
+      if (closed || !started) return;
+      if (peerIsUp(peer)) { sigConnected(); return; }
+      gaveUp = false;
+      idTakenSince = 0;
+      clearTimeout(sigTimer);
+      sigTimer = null;
+      sigDelay = 0;
+      // A reconnect already under way (awaitOpen pending) is left to finish.
+      if (openWait && peer && !peer.disconnected && !peer.destroyed) return;
+      ensureSignaling();
     };
 
     api.connect = function (roomId) {
@@ -412,6 +622,7 @@
               if (c) { try { c.close(); } catch (e) { /* ignore */ } }
               b.emit('leave', 'host');
             });
+            b.setStatus('connected');
             resolve();
           });
         });
@@ -426,6 +637,7 @@
     api.close = function () {
       if (closed) return;
       closed = true;
+      clearSigTimers();
       b.stopKeepAlive();
       Object.keys(conns).forEach(function (k) { try { conns[k].close(); } catch (e) { /* ignore */ } });
       conns = {};

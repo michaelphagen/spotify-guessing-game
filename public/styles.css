@@ -254,6 +254,30 @@ select { appearance: none; background-image: linear-gradient(45deg, transparent 
 }
 .room-chip strong { color: var(--text); letter-spacing: 0.12em; }
 
+/* Host connection status: Connected / Reconnecting… / Offline */
+.net-status { display: inline-flex; align-items: center; gap: 6px; font-size: 0.8rem; color: var(--muted); white-space: nowrap; }
+.net-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent); }
+.net-status.reconnecting .net-dot, .net-status.connecting .net-dot { background: var(--amber); animation: net-pulse 1.2s ease-in-out infinite; }
+.net-status.reconnecting, .net-status.connecting { color: var(--amber); }
+.net-status.offline .net-dot { background: var(--danger); }
+.net-status.offline { color: var(--danger); }
+@keyframes net-pulse { 50% { opacity: .35; } }
+@media (prefers-reduced-motion: reduce) { .net-dot { animation: none !important; } }
+@media (max-width: 380px) { .net-status #net-status-text { display: none; } }
+.room-chip, .topbar-right .btn-link { white-space: nowrap; }
+/* Narrow screens while hosting: the status pill needs the brand name's room. */
+@media (max-width: 520px) { .topbar:has(.net-status:not([hidden])) .brand > span:last-child { display: none; } }
+
+/* Resume / rejoin a recent room (setup screen) */
+.resume-box { display: flex; flex-direction: column; gap: 10px; }
+.resume-item {
+  display: flex; flex-direction: column; gap: 8px; padding: 12px 14px; border-radius: 12px;
+  background: var(--surface); border: 1px solid var(--accent); box-shadow: var(--shadow);
+}
+.resume-item p { margin: 0; }
+.resume-item .resume-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; }
+#pw-notyou { margin-top: 4px; }
+
 .conn-banner {
   max-width: 608px; margin: 4px auto 0; padding: 8px 14px; border-radius: 10px; font-size: 0.9rem;
   background: rgba(245, 184, 61, .1); color: var(--amber); border: 1px solid rgba(245, 184, 61, .3);

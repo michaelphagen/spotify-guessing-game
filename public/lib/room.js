@@ -12,6 +12,9 @@
  * Messages (every message carries v: PROTOCOL):
  *   player -> host  hello {name, token}
  *                   play | stop | extend | answer {optionId | text} | reveal | next
+ *                   sync                 "send me the current state again" (e.g. the
+ *                                        phone's tab was in the background); answered
+ *                                        with `state`, or error not-joined
  *   host -> player  state {state}      the sanitized snapshot for that player
  *                   playback {playback} clip status/progress while the host plays audio
  *                   error {code, message}
@@ -537,6 +540,10 @@
       }
       var p = playerByPeer(room, peerId);
       if (!p) { sendTo(peerId, errorMessage('not-joined', 'Join the room first.')); return; }
+      if (msg.type === 'sync') {
+        sendTo(peerId, message('state', { state: playerView(room, p.id) }));
+        return;
+      }
       var action = { type: msg.type, optionId: msg.optionId, text: msg.text };
       var res = run(p.id, action);
       if (!res.ok) sendTo(peerId, errorMessage(res.code, res.message));
@@ -603,12 +610,27 @@
    * @param {string} [opts.token]
    * @param {object} opts.hooks   onStatus(status, detail), onState(view), onPlayback(pb), onError(err), onToken(token)
    * @param {object} [opts.timers] { setTimeout, clearTimeout }
-   * @param {number} [opts.retryMs]      delay between reconnect attempts
-   * @param {number} [opts.maxRetries]   attempts after the host disappears
+   * @param {Function} [opts.now]
+   * @param {number} [opts.joinRetryMs]    gap between attempts while joining for the first time (4000)
+   * @param {number} [opts.joinWaitMs]     how long to keep trying to join before failing (180000; 0 = one attempt)
+   * @param {number} [opts.retryMs]        first delay before reconnecting after the host went away (1000),
+   *                                       doubling up to...
+   * @param {number} [opts.maxRetryMs]     ...this cap (10000)
+   * @param {number} [opts.maxRetries]     reconnect attempts before giving up (default: never)
+   * @param {number} [opts.replyTimeoutMs] wake(): no state this long after a `sync` = the connection is dead (6000)
    *
-   * Status: 'connecting' -> 'connected'; 'reconnecting' (the host went away,
-   * retrying); 'failed' {code, message} (a fatal error, or the host did not
-   * come back); 'left' (leave() was called).
+   * Status:
+   *   'connecting'    the first attempt
+   *   'waiting'       not joined yet and the host doesn't answer; retrying every joinRetryMs
+   *                   for joinWaitMs. detail.code: 'signaling-unreachable' (this phone's own
+   *                   network), or 'room-not-found' / 'timeout' / 'host-left' (the host's
+   *                   screen is off or the tab is in the background, or a wrong code)
+   *   'connected'
+   *   'reconnecting'  was connected and lost the host (a reload, a background tab, Wi-Fi):
+   *                   retrying with backoff, and at once on wake()
+   *   'failed'        {code, message}: a fatal error ('closed' is the host closing the room),
+   *                   or gave up (joinWaitMs / maxRetries)
+   *   'left'          leave() was called
    */
   function createPlayer(opts) {
     var hooks = opts.hooks || {};
@@ -617,16 +639,25 @@
       setTimeout: function (fn, ms) { return setTimeout(fn, ms); },
       clearTimeout: function (id) { clearTimeout(id); },
     };
-    var retryMs = opts.retryMs == null ? 2500 : opts.retryMs;
-    var maxRetries = opts.maxRetries == null ? 24 : opts.maxRetries;
+    var now = opts.now || function () { return Date.now(); };
+    var joinRetryMs = opts.joinRetryMs == null ? 4000 : opts.joinRetryMs;
+    var joinWaitMs = opts.joinWaitMs == null ? 180000 : opts.joinWaitMs;
+    var retryMs = opts.retryMs == null ? 1000 : opts.retryMs;
+    var maxRetryMs = opts.maxRetryMs == null ? 10000 : opts.maxRetryMs;
+    var maxRetries = opts.maxRetries == null ? Infinity : opts.maxRetries;
+    var replyTimeoutMs = opts.replyTimeoutMs == null ? 6000 : opts.replyTimeoutMs;
     var token = opts.token || null;
     var transport = null;
     var status = 'idle';
     var view = null;
     var everConnected = false;
     var retries = 0;
+    var delay = 0;
     var retryTimer = null;
+    var replyTimer = null;
     var attempt = 0;
+    var inFlight = false; // transport.connect() hasn't settled yet
+    var joinStarted = 0;
 
     function setStatus(s, detail) {
       status = s;
@@ -638,28 +669,70 @@
       transport = null;
     }
 
+    function clearTimers() {
+      if (retryTimer != null) timers.clearTimeout(retryTimer);
+      if (replyTimer != null) timers.clearTimeout(replyTimer);
+      retryTimer = null;
+      replyTimer = null;
+    }
+
+    function stop(s, detail) {
+      attempt++;
+      inFlight = false;
+      clearTimers();
+      closeTransport();
+      setStatus(s, detail);
+    }
+
+    /** The attempt failed or the host went away: try again later (or give up). */
     function scheduleRetry(err) {
-      if (status === 'left') return;
-      if (retries >= maxRetries) {
-        closeTransport();
-        setStatus('failed', { code: 'host-left', message: 'The host left the game.' });
-        return;
+      if (status === 'left' || status === 'failed') return;
+      if (err && err.code === 'webrtc-unsupported') { stop('failed', err); return; }
+      attempt++;
+      inFlight = false;
+      clearTimers();
+      closeTransport();
+      var wait;
+      if (!everConnected) {
+        if (now() - joinStarted >= joinWaitMs) {
+          setStatus('failed', err || { code: 'timeout', message: 'Couldn’t reach the host.' });
+          return;
+        }
+        wait = joinRetryMs;
+        setStatus('waiting', err);
+      } else {
+        if (retries >= maxRetries) {
+          setStatus('failed', { code: 'host-left', message: 'The host left the game.' });
+          return;
+        }
+        retries++;
+        delay = delay ? Math.min(delay * 2, maxRetryMs) : retryMs;
+        wait = delay;
+        setStatus('reconnecting', err);
       }
-      retries++;
-      setStatus('reconnecting', err || null);
-      timers.clearTimeout(retryTimer);
-      retryTimer = timers.setTimeout(connect, retryMs);
+      retryTimer = timers.setTimeout(function () { retryTimer = null; connect(); }, wait);
+    }
+
+    function sendHello(t) {
+      try { t.send('host', message('hello', { name: opts.name, token: token })); } catch (e) { /* the leave handler retries */ }
     }
 
     function connect() {
       closeTransport();
+      clearTimers();
       var my = ++attempt;
-      var t = opts.makeTransport();
+      var t;
+      try { t = opts.makeTransport(); } catch (e) {
+        scheduleRetry({ code: (e && e.code) || 'transport', message: (e && e.message) || 'Couldn’t connect.' });
+        return;
+      }
       transport = t;
-      if (!everConnected) setStatus('connecting');
+      inFlight = true;
+      if (!everConnected && status !== 'waiting') setStatus('connecting');
       t.onMessage(function (from, msg) {
         if (my !== attempt || !msg || typeof msg !== 'object') return;
         if (msg.type === 'state' && msg.state) {
+          if (replyTimer != null) { timers.clearTimeout(replyTimer); replyTimer = null; }
           view = msg.state;
           if (view.you && view.you.token && view.you.token !== token) {
             token = view.you.token;
@@ -667,6 +740,7 @@
           }
           everConnected = true;
           retries = 0;
+          delay = 0;
           if (status !== 'connected') setStatus('connected');
           if (hooks.onState) hooks.onState(view);
         } else if (msg.type === 'playback' && msg.playback) {
@@ -674,11 +748,10 @@
           if (hooks.onPlayback) hooks.onPlayback(msg.playback);
         } else if (msg.type === 'error') {
           var err = { code: msg.code || 'error', message: msg.message || 'Something went wrong.' };
-          if (FATAL_ERRORS.indexOf(err.code) !== -1) {
-            attempt++;
-            closeTransport();
-            setStatus('failed', err);
-          } else if (hooks.onError) hooks.onError(err);
+          if (FATAL_ERRORS.indexOf(err.code) !== -1) stop('failed', err);
+          // The host restarted or marked us offline while this connection lived on: say hello again.
+          else if (err.code === 'not-joined') sendHello(t);
+          else if (hooks.onError) hooks.onError(err);
         }
       });
       t.onPeerLeave(function () {
@@ -687,24 +760,55 @@
       });
       t.connect(opts.code).then(function () {
         if (my !== attempt) return;
-        t.send('host', message('hello', { name: opts.name, token: token }));
+        inFlight = false;
+        sendHello(t);
       }, function (err) {
         if (my !== attempt) return;
-        var e = { code: (err && err.code) || 'transport', message: (err && err.message) || 'Couldn’t connect.' };
-        // A room that existed a moment ago is probably the host reloading: keep trying.
-        if (everConnected && e.code !== 'webrtc-unsupported') { scheduleRetry(e); return; }
-        closeTransport();
-        setStatus('failed', e);
+        inFlight = false;
+        scheduleRetry({ code: (err && err.code) || 'transport', message: (err && err.message) || 'Couldn’t connect.' });
       });
     }
 
+    /** Ask the host for the current state; no answer in time means the connection is dead. */
+    function requestSync() {
+      var t = transport;
+      var my = attempt;
+      if (!t) return;
+      try { t.send('host', message('sync')); } catch (e) {
+        scheduleRetry({ code: 'host-left', message: 'Lost the connection to the host.' });
+        return;
+      }
+      if (!replyTimeoutMs) return;
+      if (replyTimer != null) timers.clearTimeout(replyTimer);
+      replyTimer = timers.setTimeout(function () {
+        replyTimer = null;
+        if (my !== attempt || status !== 'connected') return;
+        scheduleRetry({ code: 'host-left', message: 'The host didn’t answer.' });
+      }, replyTimeoutMs);
+    }
+
     return {
-      start: function () { retries = 0; connect(); },
-      /** Try again after 'failed'. */
+      start: function () { retries = 0; delay = 0; joinStarted = now(); connect(); },
+      /** Try again now (after 'failed', or to skip the wait). */
       retry: function () {
         retries = 0;
-        timers.clearTimeout(retryTimer);
+        delay = 0;
+        clearTimers();
+        if (!everConnected) joinStarted = now();
         setStatus(everConnected ? 'reconnecting' : 'connecting');
+        connect();
+      },
+      /**
+       * This page is visible / online again: `info.resumed` if it was hidden.
+       * Connected: ask for a fresh state (and notice a dead connection).
+       * Waiting to retry: retry now instead of after the backoff.
+       */
+      wake: function (info) {
+        if (status === 'idle' || status === 'left' || status === 'failed') return;
+        if (transport && transport.wake) { try { transport.wake(info || null); } catch (e) { /* ignore */ } }
+        if (status === 'connected') { requestSync(); return; }
+        if (retryTimer == null || inFlight) return; // an attempt is under way
+        delay = 0;
         connect();
       },
       act: function (type, body) {
@@ -712,16 +816,144 @@
         try { transport.send('host', message(type, body)); } catch (e) { return false; }
         return true;
       },
-      leave: function () {
-        timers.clearTimeout(retryTimer);
-        attempt++;
-        closeTransport();
-        setStatus('left');
-      },
+      leave: function () { stop('left'); },
       status: function () { return status; },
       view: function () { return view; },
       token: function () { return token; },
     };
+  }
+
+  // ---------- Saved rooms and rejoining (resume after a tab was closed or evicted) ----------
+
+  var SAVE_VERSION = 1;
+  var RESUME_MAX_AGE_MS = 12 * 60 * 60 * 1000;
+
+  function isFresh(savedAt, o) {
+    var t = o && o.now != null ? o.now : Date.now();
+    var max = o && o.maxAgeMs != null ? o.maxAgeMs : RESUME_MAX_AGE_MS;
+    var age = t - Number(savedAt);
+    return age >= 0 && age < max; // NaN (no timestamp) is not fresh
+  }
+
+  /**
+   * A hosted room as saved in localStorage (keyed by its code): the whole room,
+   * including its game, players with their tokens and scores, used songs and
+   * the track list, so resuming doesn't need to load the playlist again.
+   * @param {object} meta { now, transport, owner (this tab's id), claimedAt }
+   */
+  function savedRoomEntry(room, meta) {
+    meta = meta || {};
+    return {
+      kind: 'gts-room',
+      v: SAVE_VERSION,
+      savedAt: meta.now == null ? Date.now() : meta.now,
+      transport: meta.transport || 'peer',
+      owner: meta.owner || null,
+      claimedAt: meta.claimedAt || 0,
+      room: room,
+    };
+  }
+
+  /** The room inside a saved entry, or a bare room (the sessionStorage copy); null if unusable. */
+  function roomOf(saved, o) {
+    if (!saved || typeof saved !== 'object') return null;
+    var room = saved;
+    if (saved.kind === 'gts-room') {
+      if (saved.v !== SAVE_VERSION || !isFresh(saved.savedAt, o)) return null;
+      if (o && o.transport && saved.transport !== o.transport) return null;
+      room = saved.room;
+    }
+    if (!room || typeof room !== 'object' || room.version !== PROTOCOL || !normalizeCode(room.code)) return null;
+    if (!Array.isArray(room.players) || !Array.isArray(room.tracks) || !room.tracks.length) return null;
+    if (!room.settings || typeof room.settings !== 'object') return null;
+    // Hand-edited or damaged storage must not break the page that reads it.
+    if (!room.players.every(function (p) { return p && typeof p === 'object' && cleanName(p.name); })) return null;
+    if (!room.tracks.every(function (t) { return t && typeof t === 'object' && t.id; })) return null;
+    if (room.game && (!Array.isArray(room.game.tracks) || !Array.isArray(room.game.players))) return null;
+    return room;
+  }
+
+  /**
+   * Prepare a saved room to be hosted again. Connections didn't survive: every
+   * phone is offline until it says hello again (with its token it gets its
+   * slot, name and score back); a clip that was playing is stopped.
+   * @param {object} saved   savedRoomEntry(...) or a bare room
+   * @param {object} [o]     { now, maxAgeMs, transport }
+   * @returns the room, or null (missing, too old, other version or transport, no tracks)
+   */
+  function restoreRoom(saved, o) {
+    var room = roomOf(saved, o);
+    if (!room) return null;
+    room.players.forEach(function (p) { if (!p.local) { p.online = false; p.peerId = null; } });
+    room.turn = room.turn && typeof room.turn === 'object' ? room.turn : { playedOnce: false, heard: 0 };
+    room.playback = idlePlayback();
+    room.playback.heard = Number(room.turn.heard) || 0;
+    room.usedIds = Array.isArray(room.usedIds) ? room.usedIds : [];
+    room.notes = Array.isArray(room.notes) ? room.notes : [];
+    return room;
+  }
+
+  /** The newest resumable entry of a list (e.g. every saved room in localStorage), or null. */
+  function pickResumableRoom(entries, o) {
+    var best = null;
+    (entries || []).forEach(function (e) {
+      if (!e || e.kind !== 'gts-room' || !roomOf(e, o)) return;
+      if (!best || e.savedAt > best.savedAt) best = e;
+    });
+    return best;
+  }
+
+  /**
+   * A player's room, as saved in localStorage. `left`: the player pressed
+   * Leave (no automatic rejoin, but the setup screen still offers it).
+   */
+  function savedJoinEntry(j, meta) {
+    meta = meta || {};
+    return {
+      kind: 'gts-join',
+      v: SAVE_VERSION,
+      code: j.code,
+      name: j.name,
+      token: j.token || null,
+      transport: meta.transport || 'peer',
+      savedAt: meta.now == null ? Date.now() : meta.now,
+      left: !!j.left,
+    };
+  }
+
+  function validJoin(saved, o) {
+    if (!saved || typeof saved !== 'object' || saved.kind !== 'gts-join' || saved.v !== SAVE_VERSION) return null;
+    if (!normalizeCode(saved.code) || !cleanName(saved.name) || !isFresh(saved.savedAt, o)) return null;
+    if (o && o.transport && saved.transport !== o.transport) return null;
+    return saved;
+  }
+
+  /**
+   * What a page should do on load for the player side.
+   * @param {object} o
+   *   urlCode      the ?room= code ('' if none)
+   *   sessionJoin  {code, name} of the room this tab was in (sessionStorage: a reload), or null
+   *   savedJoin    savedJoinEntry from localStorage, or null
+   *   transport, now, maxAgeMs
+   * @returns {{action: 'rejoin', code, name, token, source: 'session'|'saved'}
+   *         | {action: 'form', code, name}            the join form, prefilled
+   *         | {action: 'none', offer: savedJoin|null}} offer: show "Rejoin room ABCD" on setup
+   */
+  function rejoinDecision(o) {
+    var saved = validJoin(o.savedJoin, o);
+    var session = o.sessionJoin && normalizeCode(o.sessionJoin.code) && cleanName(o.sessionJoin.name) ? o.sessionJoin : null;
+    function rejoin(code, name, source) {
+      var tok = saved && saved.code === code && sameName(saved.name, name) ? saved.token : null;
+      return { action: 'rejoin', code: code, name: cleanName(name), token: tok, source: source };
+    }
+    if (o.urlCode) {
+      if (session && session.code === o.urlCode) return rejoin(o.urlCode, session.name, 'session');
+      if (saved && saved.code === o.urlCode && !saved.left) return rejoin(o.urlCode, saved.name, 'saved');
+      return { action: 'form', code: o.urlCode, name: saved && saved.code === o.urlCode ? saved.name : '' };
+    }
+    if (session) return rejoin(session.code, session.name, 'session');
+    if (saved && !saved.left) return rejoin(saved.code, saved.name, 'saved');
+    return { action: 'none', offer: saved };
   }
 
   return {
@@ -754,5 +986,11 @@
     playerScreen: playerScreen,
     createHost: createHost,
     createPlayer: createPlayer,
+    RESUME_MAX_AGE_MS: RESUME_MAX_AGE_MS,
+    savedRoomEntry: savedRoomEntry,
+    restoreRoom: restoreRoom,
+    pickResumableRoom: pickResumableRoom,
+    savedJoinEntry: savedJoinEntry,
+    rejoinDecision: rejoinDecision,
   };
 });

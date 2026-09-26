@@ -174,3 +174,239 @@ test('PeerTransport: a replacement connection from the same peer keeps its keep-
     if (!hadRTC) delete globalThis.RTCPeerConnection;
   }
 });
+
+test('keep-alive: nobody is timed out while the page is hidden, and peers get a grace period when it comes back', async () => {
+  // A BroadcastChannel per transport whose outgoing traffic can be cut (a frozen tab).
+  function mutable() {
+    const ctl = { muted: false };
+    class BC extends BroadcastChannel { postMessage(m) { if (!ctl.muted) super.postMessage(m); } }
+    return { ctl, BC };
+  }
+  const h = mutable();
+  const p = mutable();
+  let hostHidden = false;
+  const opts = { probeMs: 30, connectMs: 40, keepAliveMs: 20, timeoutMs: 100 };
+  const host = Transport.create('local', { ...opts, BroadcastChannel: h.BC, isHidden: () => hostHidden });
+  await host.host('HIDE');
+  const pl = Transport.create('local', { ...opts, BroadcastChannel: p.BC });
+  const left = [];
+  host.onPeerLeave(() => left.push('host saw player leave'));
+  pl.onPeerLeave(() => left.push('player saw host leave'));
+  await pl.connect('HIDE');
+  assert.equal(host.status(), 'connected');
+
+  // The host's page is in the background; nothing from the player gets through
+  // (the host's own view of time can't be trusted), for 4x the timeout.
+  hostHidden = true;
+  p.ctl.muted = true;
+  await wait(400);
+  assert.deepEqual(left, [], 'no timeouts while hidden');
+
+  // Visible again: last-seen clocks restart with a 2x timeout grace period.
+  hostHidden = false;
+  host.wake({ resumed: true });
+  await wait(150); // longer than the timeout, still silent
+  assert.deepEqual(left, [], 'grace period after coming back');
+  p.ctl.muted = false;
+  await wait(300);
+  assert.deepEqual(left, [], 'the player is heard again: nobody dropped');
+
+  // A player that really went quiet while the host is visible is still dropped.
+  p.ctl.muted = true;
+  await until(() => left.includes('host saw player leave'), 2000);
+  pl.close();
+  host.close();
+});
+
+test('PeerTransport host: gets the room back on the signaling server (reconnect, new Peer with the same id, unavailable-id retries)', async () => {
+  const { EventEmitter } = require('node:events');
+  const peers = [];
+  let reconnectMode = 'open'; // what the server does when a disconnected Peer reconnects
+  let newPeerMode = 'open'; // ... and when a new Peer registers
+  const later = (fn) => setTimeout(fn, 2);
+  class FakePeer extends EventEmitter {
+    constructor(id, options) {
+      super();
+      this.id = id; this.options = options; this.open = false; this.disconnected = false; this.destroyed = false; this.reconnects = 0;
+      peers.push(this);
+      later(() => this.serve(newPeerMode, false));
+    }
+    serve(mode, reconnecting) {
+      if (this.destroyed) return;
+      if (mode === 'open') { this.open = true; this.disconnected = false; this.emit('open', this.id); }
+      else if (mode === 'taken') {
+        // Like PeerJS's _abort: the error, then disconnect() (or destroy() before it ever opened).
+        this.emit('error', Object.assign(new Error('ID is taken'), { type: 'unavailable-id' }));
+        if (reconnecting) { this.open = false; this.disconnected = true; this.emit('disconnected', this.id); }
+        else this.destroy();
+      } // 'hang': the server never answers
+    }
+    reconnect() {
+      if (this.destroyed) throw new Error('destroyed');
+      if (!this.disconnected) throw new Error('not disconnected');
+      this.reconnects++;
+      this.disconnected = false;
+      later(() => this.serve(reconnectMode, true));
+    }
+    /** The socket closed (Wi-Fi blip): PeerJS emits a network error, then 'disconnected'. */
+    dropSignaling() {
+      this.open = false; this.disconnected = true;
+      this.emit('error', Object.assign(new Error('Lost connection to server.'), { type: 'network' }));
+      this.emit('disconnected', this.id);
+    }
+    disconnect() {
+      if (this.disconnected) return;
+      this.open = false; this.disconnected = true;
+      this.emit('disconnected', this.id);
+    }
+    destroy() {
+      if (this.destroyed) return;
+      this.destroyed = true; this.open = false; this.disconnected = true;
+      this.emit('close');
+    }
+  }
+  const hadRTC = 'RTCPeerConnection' in globalThis;
+  if (!hadRTC) globalThis.RTCPeerConnection = function () {};
+  try {
+    const t = Transport.PeerTransport({
+      Peer: FakePeer, keepAliveMs: 1000, timeoutMs: 5000,
+      signalingRetryMs: 10, signalingRetryMaxMs: 40, reopenTimeoutMs: 60, idRetryForMs: 300,
+    });
+    const statuses = [];
+    const errors = [];
+    t.onStatus((s) => statuses.push(s));
+    t.onError((e) => errors.push(e.code));
+    await t.host('ABCD');
+    assert.equal(t.status(), 'connected');
+    const p0 = peers[0];
+
+    // 1. A Wi-Fi blip while visible: reconnect() after a short backoff.
+    p0.dropSignaling();
+    assert.equal(t.status(), 'reconnecting');
+    await until(() => t.status() === 'connected');
+    assert.equal(p0.reconnects, 1);
+    assert.deepEqual(errors, [], 'a transient signaling error is not reported as an error');
+
+    // 2. The tab was in the background and the socket is gone: wake() reconnects at once.
+    p0.open = false; p0.disconnected = true; // (the browser hasn't delivered the close event yet)
+    t.wake({ resumed: true });
+    assert.equal(p0.reconnects, 2, 'reconnect() is called synchronously on wake');
+    await until(() => t.status() === 'connected');
+
+    // 3. The Peer was destroyed: a new Peer with the SAME id, and players can connect to it.
+    p0.destroyed = true; p0.open = false;
+    t.wake({ resumed: true });
+    assert.equal(peers.length, 2);
+    assert.equal(peers[1].id, 'gts-room-ABCD');
+    assert.ok(peers[1].options.token, 'the host Peer has a token');
+    assert.equal(peers[1].options.token, peers[0].options.token, 'same token: the server lets it take over the old registration');
+    await until(() => t.status() === 'connected');
+    const joins = [];
+    t.onPeerJoin((id) => joins.push(id));
+    const conn = Object.assign(new EventEmitter(), { peer: 'px', open: true, send() {}, close() {} });
+    peers[1].emit('connection', conn);
+    conn.emit('open');
+    assert.deepEqual(joins, ['px']);
+
+    // 4. A reconnect that never opens: it is aborted and retried, and the Peer
+    // (with the players' data connections) is kept.
+    reconnectMode = 'hang';
+    peers[1].dropSignaling();
+    await until(() => peers[1].reconnects >= 3, 3000);
+    assert.equal(peers.length, 2, 'no new Peer');
+    assert.equal(peers[1].destroyed, false);
+    reconnectMode = 'open';
+    await until(() => t.status() === 'connected');
+
+    // 5. The server still holds the old registration for a while: retried, then back.
+    reconnectMode = 'taken';
+    const p2 = peers[1];
+    p2.dropSignaling();
+    await until(() => p2.reconnects >= 3, 2000);
+    assert.equal(t.status(), 'reconnecting');
+    reconnectMode = 'open';
+    await until(() => t.status() === 'connected', 2000);
+    assert.deepEqual(errors, []);
+
+    // 6. Taken for longer than idRetryForMs: reported once, status offline, retrying stops...
+    reconnectMode = 'taken';
+    p2.dropSignaling();
+    await until(() => errors.length === 1, 3000);
+    assert.deepEqual(errors, ['room-taken']);
+    assert.equal(t.status(), 'offline');
+    const n = p2.reconnects;
+    await wait(100);
+    assert.equal(p2.reconnects, n, 'no more retries after giving up');
+    // ...until the page wakes up again.
+    reconnectMode = 'open';
+    t.wake({});
+    await until(() => t.status() === 'connected');
+    assert.ok(statuses.includes('reconnecting') && statuses.includes('offline'));
+
+    // 7. Closed: no reconnects afterwards.
+    t.close();
+    const count = peers.length;
+    const r = peers.at(-1).reconnects;
+    peers.at(-1).emit('disconnected');
+    await wait(80);
+    assert.equal(peers.length, count);
+    assert.equal(peers.at(-1).reconnects, r);
+  } finally {
+    if (!hadRTC) delete globalThis.RTCPeerConnection;
+  }
+});
+
+test('PeerTransport host: a long signaling outage keeps the Peer and the players\' data connections', async () => {
+  const { EventEmitter } = require('node:events');
+  const peers = [];
+  let up = true;
+  class FakePeer extends EventEmitter {
+    constructor(id) { super(); this.id = id; this.open = false; this.disconnected = false; this.destroyed = false; peers.push(this); setTimeout(() => this.serve(), 2); }
+    serve() {
+      if (this.destroyed) return;
+      if (up) { this.open = true; this.disconnected = false; this.emit('open', this.id); return; }
+      // The server can't be reached: the socket closes at once (PeerJS: network error, then disconnect).
+      this.emit('error', Object.assign(new Error('Lost connection to server.'), { type: 'network' }));
+      this.open = false; this.disconnected = true; this.emit('disconnected', this.id);
+    }
+    reconnect() { this.disconnected = false; setTimeout(() => this.serve(), 2); }
+    disconnect() { if (this.disconnected) return; this.open = false; this.disconnected = true; this.emit('disconnected', this.id); }
+    destroy() { if (this.destroyed) return; this.destroyed = true; this.open = false; this.disconnected = true; this.emit('close'); }
+  }
+  const hadRTC = 'RTCPeerConnection' in globalThis;
+  if (!hadRTC) globalThis.RTCPeerConnection = function () {};
+  let t = null;
+  try {
+    t = Transport.PeerTransport({
+      Peer: FakePeer, keepAliveMs: 1000, timeoutMs: 60000,
+      signalingRetryMs: 10, signalingRetryMaxMs: 80, reopenTimeoutMs: 40,
+    });
+    const left = [];
+    t.onPeerLeave((id) => left.push(id));
+    await t.host('LONG');
+    const conn = Object.assign(new EventEmitter(), {
+      peer: 'px', open: true, sent: 0,
+      send() { this.sent++; },
+      close() { if (this.open) { this.open = false; this.emit('close'); } },
+    });
+    peers[0].on('close', () => conn.close()); // like PeerJS: destroy() closes its connections
+    peers[0].emit('connection', conn);
+    conn.emit('open');
+
+    up = false;
+    peers[0].open = false; peers[0].disconnected = true; peers[0].emit('disconnected', peers[0].id);
+    await wait(600); // many reopen timeouts and backoff rounds
+    assert.equal(t.status(), 'reconnecting');
+    assert.equal(peers.length, 1, 'the Peer is not replaced');
+    assert.deepEqual(left, [], 'the player is still connected');
+    t.send('px', { hi: 1 });
+    assert.equal(conn.sent, 1);
+
+    up = true;
+    await until(() => t.status() === 'connected');
+    assert.equal(peers.length, 1);
+  } finally {
+    if (t) t.close();
+    if (!hadRTC) delete globalThis.RTCPeerConnection;
+  }
+});

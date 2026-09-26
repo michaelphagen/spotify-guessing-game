@@ -29,6 +29,12 @@
   var STORE_JOIN = 'gts:join'; // { code, name } of the room this tab plays in (sessionStorage)
   var LOCAL_NAME = 'gts:name'; // last name used to join (localStorage)
   var LOCAL_TOKEN = 'gts:token:'; // + CODE + ':' + name -> player token (localStorage)
+  // Resumable rooms (localStorage, 12 hours): survive closing the tab, or the
+  // browser evicting it. Cleared when the room is closed on purpose.
+  var LOCAL_ROOM = 'gts:saved-room:'; // + CODE -> Room.savedRoomEntry (the hosted room, tracks included)
+  var LOCAL_JOIN = 'gts:saved-join'; // Room.savedJoinEntry: the room this device plays in
+  // Tells this tab's saved room apart from another tab's (see the 'storage' listener).
+  var TAB_ID = Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
   var MAX_PLAYERS = 12;
   var Room = window.Room;
   var Transport = window.Transport;
@@ -73,6 +79,21 @@
   var local = {
     get: function (key) { try { return window.localStorage.getItem(key); } catch (e) { return null; } },
     set: function (key, value) { try { window.localStorage.setItem(key, value); } catch (e) { /* ignore */ } },
+    remove: function (key) { try { window.localStorage.removeItem(key); } catch (e) { /* ignore */ } },
+    getJSON: function (key) { try { var v = window.localStorage.getItem(key); return v ? JSON.parse(v) : null; } catch (e) { return null; } },
+    setJSON: function (key, value) {
+      try { window.localStorage.setItem(key, JSON.stringify(value)); return true; } catch (e) { return false; }
+    },
+    keys: function (prefix) {
+      var out = [];
+      try {
+        for (var i = 0; i < window.localStorage.length; i++) {
+          var k = window.localStorage.key(i);
+          if (k && k.indexOf(prefix) === 0) out.push(k);
+        }
+      } catch (e) { /* ignore */ }
+      return out;
+    },
   };
 
   var toastTimer = null;
@@ -97,6 +118,7 @@
     if (name !== currentScreen) window.scrollTo(0, 0);
     currentScreen = name;
     renderRoomChip();
+    renderNetStatus();
   }
 
   /** "Room ABCD" in the header while hosting a started game or playing in a room. */
@@ -321,7 +343,7 @@
   var resultMode = null; // 'listen' when the result-screen preview is playing
 
   function saveGame() {
-    if (hosting) { store.set(STORE_ROOM, hosting.room); return; }
+    if (hosting) { store.set(STORE_ROOM, hosting.room); persistHostRoom(); return; }
     if (game) store.set(STORE_GAME, game);
     else store.remove(STORE_GAME);
   }
@@ -463,6 +485,7 @@
     refreshExcludeHint();
     setupError('');
     showScreen('setup');
+    try { renderResumeOffers(); } catch (e) { $('resume-box').hidden = true; if (window.console) console.error(e); }
   }
 
   /**
@@ -901,16 +924,50 @@
     openRoom(room, true);
   }
 
-  /** Start hosting `room` (new, or restored after a reload). */
+  /** Start hosting `room` (new, restored after a reload, or resumed from localStorage). */
   function openRoom(room, fresh) {
     closeRoom();
     leaveRoom();
-    hosting = { room: room, ctl: null, transport: null, status: 'connecting', error: null, attempts: 0, fresh: fresh };
+    hosting = {
+      room: room, ctl: null, transport: null, status: 'connecting', error: null, attempts: 0, fresh: fresh,
+      net: 'idle', netError: null, claimedAt: Date.now(),
+    };
     game = room.game;
+    setHostUrl(room.code);
     saveGame();
     connectHost();
     showHostScreen();
     keepAwake(true);
+  }
+
+  /** The saved copy of the hosted room (localStorage), for "Resume room" after the tab is gone. */
+  function persistHostRoom() {
+    var h = hosting;
+    if (!h) return;
+    var key = LOCAL_ROOM + h.room.code;
+    // A finished game isn't worth resuming: "End game" / the last song clears it.
+    if (h.room.game && h.room.game.phase === 'over') { local.remove(key); return; }
+    local.setJSON(key, Room.savedRoomEntry(h.room, { now: Date.now(), transport: TRANSPORT_KIND, owner: TAB_ID, claimedAt: h.claimedAt }));
+  }
+
+  /** Reopen a saved room (same code): phones with their token get their slots back. */
+  function resumeRoom(room) {
+    store.remove(STORE_GAME);
+    openRoom(room, false);
+  }
+
+  /** ?host=CODE while hosting: if the browser reloads an evicted tab, the room is resumed. */
+  function setHostUrl(code) {
+    try {
+      var url = window.location.pathname + '?host=' + encodeURIComponent(code) + (TRANSPORT_KIND === 'local' ? '&transport=local' : '');
+      window.history.replaceState(null, '', url);
+    } catch (e) { /* ignore */ }
+  }
+
+  function currentUrlHost() {
+    var m = /[?&]host=([^&#]*)/.exec(window.location.search);
+    if (!m) return '';
+    try { return Room.normalizeCode(decodeURIComponent(m[1])); } catch (e) { return ''; }
   }
 
   function connectHost() {
@@ -920,16 +977,26 @@
     var t = Transport.create(TRANSPORT_KIND, transportOptions());
     h.transport = t;
     h.status = h.attempts ? 'retrying' : 'connecting';
+    h.net = 'idle';
+    h.netError = null;
     h.ctl = Room.createHost({
       room: h.room,
       transport: t,
       hooks: { onEffect: onRoomEffect, onChange: onRoomChange },
     });
+    // Signaling status after the room opened: the transport reconnects on its own.
+    if (t.onStatus) {
+      t.onStatus(function (st) {
+        if (hosting !== h || h.transport !== t) return;
+        h.net = st;
+        if (st === 'connected') h.netError = null;
+        renderHostConn();
+      });
+    }
     t.onError(function (err) {
       if (hosting !== h || h.transport !== t) return;
-      toast(err.code === 'signaling-unreachable'
-        ? 'Lost the PeerJS signaling server. Players already in the room can keep playing; new players can’t join until it’s back.'
-        : err.message, 6000);
+      if (err.code === 'room-taken') { h.netError = err; renderHostConn(); return; }
+      toast(err.message, 6000);
     });
     renderHostConn();
     t.host(h.room.code).then(function () {
@@ -942,23 +1009,33 @@
     }, function (err) {
       if (hosting !== h || h.transport !== t) return;
       if (err.code === 'room-taken') {
-        if (!h.room.game && !h.room.players.some(function (p) { return !p.local; }) && h.attempts < 5) {
+        if (!h.room.game && !h.room.players.some(function (p) { return !p.local; }) && h.attempts < 5 && h.fresh) {
           // A brand-new room: just pick another code.
           h.attempts++;
+          local.remove(LOCAL_ROOM + h.room.code);
           h.room.code = Room.generateCode();
+          setHostUrl(h.room.code);
           saveGame();
           showHostScreen();
           connectHost();
           return;
         }
-        // Restoring after a reload: the old page's registration can linger briefly.
-        if (h.attempts < 8) {
+        // Reopening after a reload or resume: the signaling server can hold the
+        // old page's registration for a while. Keep trying for about 30 seconds.
+        if (h.attempts < 12) {
           h.attempts++;
           h.status = 'retrying';
           renderHostConn();
           setTimeout(function () { if (hosting === h && h.transport === t) connectHost(); }, 2500);
           return;
         }
+        err = Transport.transportError('room-taken', 'Room ' + h.room.code + ' is still open somewhere else (another tab or device?). Close it there, or wait a minute.');
+      } else if (err.code === 'signaling-unreachable' && h.attempts < 3 && navigator.onLine !== false) {
+        h.attempts++;
+        h.status = 'retrying';
+        renderHostConn();
+        setTimeout(function () { if (hosting === h && h.transport === t) connectHost(); }, 3000);
+        return;
       }
       h.status = 'error';
       h.error = err;
@@ -966,7 +1043,11 @@
     });
   }
 
-  /** Stop hosting. Players are told the room closed (unless the page is just reloading). */
+  /**
+   * Stop hosting on purpose ("Close the room", back to setup, joining another
+   * room): players are told, and the saved room is forgotten. A reload or a
+   * closed tab doesn't come through here, so the room can be resumed.
+   */
   function closeRoom() {
     if (!hosting) return;
     var h = hosting;
@@ -980,34 +1061,93 @@
     var t = h.transport;
     setTimeout(function () { try { t.close(); } catch (e) { /* ignore */ } }, 300);
     store.remove(STORE_ROOM);
+    local.remove(LOCAL_ROOM + h.room.code);
+    if (currentUrlHost()) setUrlRoom('');
     banner('');
+    renderNetStatus();
     keepAwake(false);
+  }
+
+  /** Another tab resumed this room: it is the host now. Stop quietly (no "closed" to players). */
+  function yieldRoom() {
+    var h = hosting;
+    if (!h) return;
+    hosting = null;
+    try { h.transport.close(); } catch (e) { /* ignore */ }
+    store.remove(STORE_ROOM);
+    player.unload();
+    game = null;
+    setUrlRoom('');
+    keepAwake(false);
+    goToSetup();
+    toast('Room ' + h.room.code + ' is now hosted in another tab.', 6000);
+  }
+
+  /** 'connecting' | 'connected' | 'reconnecting' | 'offline' for the host's status pill. */
+  function hostNetState() {
+    var h = hosting;
+    if (!h) return null;
+    if (navigator.onLine === false || h.status === 'error') return 'offline';
+    if (h.status === 'connecting') return 'connecting';
+    if (h.status === 'retrying') return 'reconnecting';
+    if (h.net === 'offline' || h.netError) return 'offline';
+    if (h.net === 'reconnecting') return 'reconnecting';
+    return 'connected';
+  }
+
+  var NET_LABELS = { connecting: 'Connecting…', connected: 'Connected', reconnecting: 'Reconnecting…', offline: 'Offline' };
+  function renderNetStatus() {
+    var st = hostNetState();
+    var pill = $('net-status');
+    pill.hidden = !st;
+    if (!st) return;
+    pill.className = 'net-status ' + st;
+    $('net-status-text').textContent = NET_LABELS[st];
+    pill.title = st === 'connected' ? 'Players can join and play.'
+      : st === 'offline' ? 'New players can’t join right now.'
+      : 'Getting the room back online. Players reconnect on their own.';
   }
 
   function renderHostConn() {
     var h = hosting;
+    renderNetStatus();
     if (!h) return;
     var msg = '';
     var bad = false;
+    var retry = null;
     var peerNote = TRANSPORT_KIND === 'local' ? ' (same-browser test mode)' : '';
+    var net = hostNetState();
     if (h.status === 'connecting') msg = 'Opening room ' + h.room.code + peerNote + '…';
     else if (h.status === 'retrying') msg = 'Reopening room ' + h.room.code + '… Players will reconnect automatically.';
-    else if (h.status === 'error') { msg = (h.error && h.error.message ? h.error.message : 'Couldn’t open the room.') + ' Tap “Try again”.'; bad = true; }
+    else if (h.status === 'error') {
+      msg = (h.error && h.error.message ? h.error.message : 'Couldn’t open the room.') + ' Tap “Try again”.';
+      bad = true;
+      retry = function () { h.attempts = 0; connectHost(); };
+    } else if (navigator.onLine === false) {
+      msg = 'This device is offline. The room comes back when the internet does; players reconnect on their own.';
+      bad = true;
+    } else if (net === 'offline') {
+      msg = (h.netError && h.netError.message ? h.netError.message : 'Lost the connection to the signaling server.') + ' New players can’t join.';
+      bad = true;
+      retry = function () { h.netError = null; if (h.transport.wake) h.transport.wake({}); renderHostConn(); };
+    } else if (net === 'reconnecting') {
+      msg = 'Reconnecting to the signaling server… Players already here can keep playing; new players can join once it’s back.';
+    }
     // Lobby: inline notice with a retry button. In game: the banner.
     var lc = $('lobby-conn');
     lc.textContent = '';
     if (msg) {
       lc.appendChild(document.createTextNode(msg + ' '));
-      if (h.status === 'error') lc.appendChild(el('button', { type: 'button', class: 'btn-link', id: 'host-retry', text: 'Try again', onclick: function () { h.attempts = 0; connectHost(); } }));
+      if (retry) lc.appendChild(el('button', { type: 'button', class: 'btn-link', id: 'host-retry', text: 'Try again', onclick: retry }));
     }
     lc.hidden = !msg;
     lc.classList.toggle('bad', bad);
     if (h.room.game) {
       banner(msg, bad);
-      if (h.status === 'error') {
+      if (retry) {
         var b = $('conn-banner');
         b.appendChild(document.createTextNode(' '));
-        b.appendChild(el('button', { type: 'button', class: 'btn-link', text: 'Try again', onclick: function () { h.attempts = 0; connectHost(); } }));
+        b.appendChild(el('button', { type: 'button', class: 'btn-link', text: 'Try again', onclick: retry }));
       }
     } else banner('');
   }
@@ -1189,8 +1329,34 @@
     });
   }
 
+  /**
+   * The page is visible / focused / online again. The browser released the
+   * wake lock when the page was hidden: ask again. The host's transport checks
+   * its signaling connection (and restarts keep-alive clocks if the page was
+   * hidden); a player asks the host for a fresh state, or retries at once.
+   */
+  var hiddenAt = document.hidden ? Date.now() : 0;
+  var lastWake = 0;
+  function onWake(reason) {
+    if (document.visibilityState === 'hidden') return;
+    var t = Date.now();
+    if (reason === 'focus' && t - lastWake < 2000) return; // focus follows visibilitychange
+    lastWake = t;
+    var resumed = reason === 'visible' || reason === 'pageshow' || !!hiddenAt;
+    hiddenAt = 0;
+    if (wantAwake) keepAwake(true);
+    if (hosting) {
+      var h = hosting;
+      if (h.status === 'error' && (reason === 'visible' || reason === 'online')) { h.attempts = 0; connectHost(); }
+      else if (h.status === 'open' && h.transport && h.transport.wake) h.transport.wake({ resumed: resumed });
+      renderHostConn();
+    }
+    if (joined) joined.ctl.wake({ resumed: resumed });
+  }
+
   // Screen wake lock: a sleeping host (or phone) drops out of the room.
   var wakeLock = null;
+  var wakeLockPending = false;
   var wantAwake = false;
   function keepAwake(on) {
     wantAwake = on;
@@ -1199,12 +1365,16 @@
       wakeLock = null;
       return;
     }
-    if (wakeLock || !navigator.wakeLock || document.visibilityState !== 'visible') return;
+    // One request at a time: visibilitychange, pageshow and online can fire together,
+    // and a second lock would be orphaned (never released by keepAwake(false)).
+    if (wakeLock || wakeLockPending || !navigator.wakeLock || document.visibilityState !== 'visible') return;
+    wakeLockPending = true;
     navigator.wakeLock.request('screen').then(function (lock) {
+      wakeLockPending = false;
       wakeLock = lock;
-      lock.addEventListener('release', function () { wakeLock = null; });
+      lock.addEventListener('release', function () { if (wakeLock === lock) wakeLock = null; });
       if (!wantAwake) keepAwake(false);
-    }, function () { /* not allowed; fine */ });
+    }, function () { wakeLockPending = false; /* not allowed; fine */ });
   }
 
   // =====================================================================
@@ -1229,14 +1399,15 @@
     } catch (e) { /* ignore */ }
   }
 
-  function goToJoin(code, error) {
+  function goToJoin(code, error, name) {
     closeRoom();
     leaveRoom();
     player.unload();
     game = null;
     showScreen('join');
     $('join-code').value = code || currentUrlRoom() || '';
-    if (!$('join-name').value) $('join-name').value = local.get(LOCAL_NAME) || '';
+    if (name != null) $('join-name').value = name;
+    else if (!$('join-name').value) $('join-name').value = local.get(LOCAL_NAME) || '';
     joinError(error || '');
     ($('join-code').value ? $('join-name') : $('join-code')).focus();
   }
@@ -1255,33 +1426,54 @@
     joinRoom(code, name);
   }
 
-  function joinRoom(code, name) {
+  /**
+   * Join (or rejoin) a room. o.auto: rejoined without the form (a saved room),
+   * so the "Not you?" link is offered; o.token: the saved player token.
+   */
+  function joinRoom(code, name, o) {
+    o = o || {};
     closeRoom();
     leaveRoom();
     game = null;
     local.set(LOCAL_NAME, name);
     store.set(STORE_JOIN, { code: code, name: name });
     setUrlRoom(code);
-    var j = { code: code, name: name, ctl: null, view: null, playback: null, status: 'connecting', detail: null, optionsKey: '', pending: false };
+    var token = local.get(tokenKey(code, name)) || o.token || null;
+    var j = { code: code, name: name, token: token, auto: !!o.auto, ctl: null, view: null, playback: null, status: 'connecting', detail: null, optionsKey: '', pending: false, savedAt: 0 };
     joined = j;
+    // Remembered in localStorage (saveJoin) only once the host has let us in:
+    // a mistyped code must not be rejoined automatically for 12 hours.
     j.ctl = Room.createPlayer({
       code: code,
       name: name,
-      token: local.get(tokenKey(code, name)),
+      token: token,
       makeTransport: function () { return Transport.create(TRANSPORT_KIND, transportOptions()); },
       hooks: {
-        onStatus: function (s, d) { if (joined !== j) return; j.status = s; j.detail = d; renderPlayer(); },
+        onStatus: function (s, d) {
+          if (joined !== j) return;
+          j.status = s;
+          j.detail = d;
+          // The room is gone for good: don't offer to rejoin it. Any other failure
+          // (gave up waiting, replaced, ...): offer it on setup, but don't rejoin by itself.
+          if (s === 'failed') {
+            if (d && (d.code === 'closed' || d.code === 'removed')) forgetJoin(j);
+            else markJoinLeft(j);
+          }
+          renderPlayer();
+        },
         onState: function (v) {
           if (joined !== j) return;
           j.view = v;
           j.playback = v.playback;
           j.playbackAt = now();
           j.pending = false;
+          if (v.you && v.you.name && v.you.name !== j.name) j.name = v.you.name;
+          if (Date.now() - j.savedAt > 60000) saveJoin(j); // "last played" for the 12-hour window
           renderPlayer();
         },
         onPlayback: function (pb) { if (joined !== j) return; j.playback = pb; j.playbackAt = now(); renderPlayerPlayback(); },
         onError: function (err) { if (joined !== j) return; j.pending = false; toast(err.message); renderPlayer(); },
-        onToken: function (t) { local.set(tokenKey(code, name), t); },
+        onToken: function (t) { local.set(tokenKey(code, name), t); j.token = t; saveJoin(j); },
       },
     });
     j.ctl.start();
@@ -1289,12 +1481,31 @@
     renderPlayer();
   }
 
-  /** Leave the room this tab plays in (if any). */
+  /** Remember the room this device plays in (localStorage), for rejoining after the tab is gone. */
+  function saveJoin(j, left) {
+    j.savedAt = Date.now();
+    local.setJSON(LOCAL_JOIN, Room.savedJoinEntry({ code: j.code, name: j.name, token: j.token, left: !!left }, { now: j.savedAt, transport: TRANSPORT_KIND }));
+  }
+
+  function markJoinLeft(j) {
+    var saved = local.getJSON(LOCAL_JOIN);
+    if (saved && saved.code === j.code && !saved.left) { saved.left = true; local.setJSON(LOCAL_JOIN, saved); }
+    j.savedAt = 0; // "Try again" works: the next state saves it again
+  }
+
+  function forgetJoin(j) {
+    var saved = local.getJSON(LOCAL_JOIN);
+    if (saved && saved.code === j.code) local.remove(LOCAL_JOIN);
+  }
+
+  /** Leave the room this tab plays in (if any). The setup screen still offers "Rejoin". */
   function leaveRoom() {
     if (!joined) return;
     var j = joined;
     joined = null;
     j.ctl.leave();
+    var saved = local.getJSON(LOCAL_JOIN);
+    if (saved && saved.code === j.code && saved.name === j.name && !saved.left) saveJoin(j, true);
     store.remove(STORE_JOIN);
     setUrlRoom('');
     cancelAnimationFrame(pbRaf);
@@ -1334,22 +1545,48 @@
       showWait({ title: FAIL_TITLES[d.code] || 'Disconnected', sub: d.message || '', spinner: false, actions: true });
       return;
     }
+    if (j.status === 'waiting') {
+      // Not in yet, and the host doesn't answer: usually its screen is off or the
+      // game is in the background. Keep trying (Room.createPlayer, ~3 minutes).
+      banner('');
+      var own = d0(j).code === 'signaling-unreachable';
+      showWait({
+        meta: 'Room ' + j.code + ' · ' + j.name,
+        title: own ? 'Can’t reach the connection server' : 'Waiting for the host’s screen to come back…',
+        sub: own ? 'Check this phone’s internet connection (Wi-Fi or mobile data). Still trying…'
+          : 'Ask the host to open the game on their device and keep the screen on. You’ll join as soon as it’s back. (Wrong code? Leave and check it.)',
+        spinner: true,
+        actions: true,
+        retry: false,
+        leave: true,
+        notYou: j.auto,
+      });
+      return;
+    }
     if (j.status === 'connecting' || !j.view) {
       banner('');
-      showWait({ meta: 'Room ' + j.code, title: 'Joining…', sub: TRANSPORT_KIND === 'local' ? 'Same-browser test mode.' : 'Connecting to the host’s device.', spinner: true });
+      showWait({
+        meta: 'Room ' + j.code + (j.auto ? ' · ' + j.name : ''),
+        title: j.auto ? 'Rejoining…' : 'Joining…',
+        sub: TRANSPORT_KIND === 'local' ? 'Same-browser test mode.' : 'Connecting to the host’s device.',
+        spinner: true,
+        notYou: j.auto,
+      });
       return;
     }
     banner('');
     var v = j.view;
     if (j.status === 'reconnecting') {
-      // Usually the host reloading: the game continues when it's back.
+      // The host's screen went off, its page reloaded, or a network blip: the
+      // game continues where it left off when it's back. Retrying for as long as it takes.
       showWait({
         meta: 'Room ' + j.code,
-        title: 'Host disconnected',
-        sub: 'Reconnecting… If the host’s page comes back, the game continues where it left off.',
+        title: 'Reconnecting to the host…',
+        sub: 'If the host’s screen turned off or the game went to the background, ask them to open it again. The game continues where it left off.',
         spinner: true,
         actions: true,
         retry: false,
+        leave: true,
       });
       return;
     }
@@ -1369,6 +1606,7 @@
         title: 'You’re in, ' + v.you.name + '!',
         sub: 'Waiting for the host to start the game. ' + names.length + ' player' + (names.length === 1 ? '' : 's') + ' here.',
         spinner: true,
+        notYou: j.auto,
       });
     } else if (screen === 'waiting') {
       var t = v.turn;
@@ -1395,6 +1633,8 @@
     return (t.rounds ? 'Round ' + t.round + ' of ' + t.rounds : 'Round ' + t.round) + ' · Song ' + t.song + ' of ' + t.songs;
   }
 
+  function d0(j) { return j.detail || {}; }
+
   function showWait(o) {
     showScreen('pwait');
     $('pw-meta').textContent = o.meta || '';
@@ -1404,6 +1644,8 @@
     $('pw-clip').hidden = !o.clip;
     $('pw-actions').hidden = !o.actions;
     $('pw-retry').hidden = o.retry === false;
+    $('pw-setup').textContent = o.leave ? 'Leave' : 'Back to setup';
+    $('pw-notyou').hidden = !o.notYou;
   }
 
   function renderPlayerTurn(v) {
@@ -1606,27 +1848,101 @@
   // ---------- Restore after reload ----------
 
   /**
-   * After a reload: a hosted room is reopened with the same code (players
-   * reconnect on their own), a player tab rejoins its room, otherwise a
-   * pass-the-phone game continues.
+   * On load: a hosted room is reopened with the same code (players reconnect
+   * on their own), a player rejoins its room, otherwise a pass-the-phone game
+   * continues (restore()).
+   *   1. sessionStorage says this tab was hosting (a reload).
+   *   2. The URL says so (?host=CODE): the browser reloaded a tab it had evicted,
+   *      which can lose sessionStorage; the room comes from localStorage.
+   *   3. The player side: Room.rejoinDecision (?room=CODE, this tab's session,
+   *      or a room this device played in during the last 12 hours).
    */
   function restoreRoom() {
     var urlRoom = currentUrlRoom();
-    var saved = store.get(STORE_ROOM);
-    if (saved && saved.version === Room.PROTOCOL && saved.code && saved.players && (!urlRoom || urlRoom === saved.code)) {
-      // Connections didn't survive the reload: everyone with a phone must rejoin.
-      saved.players.forEach(function (p) { if (!p.local) { p.online = false; p.peerId = null; } });
-      saved.playback = { status: 'idle', pos: 0, heard: saved.turn ? saved.turn.heard : 0, from: 0, to: 0, extended: false, message: '' };
-      openRoom(saved, false);
-      return true;
+    var urlHost = currentUrlHost();
+    var sess = store.get(STORE_ROOM);
+    var room = sess && (!urlRoom || urlRoom === sess.code) && (!urlHost || urlHost === sess.code) ? Room.restoreRoom(sess) : null;
+    if (room) { resumeRoom(room); return true; }
+    if (urlHost) {
+      room = Room.restoreRoom(local.getJSON(LOCAL_ROOM + urlHost), { transport: TRANSPORT_KIND });
+      if (room) { resumeRoom(room); return true; }
+      setUrlRoom(''); // nothing to resume: show setup
+      return false;
     }
-    if (urlRoom) {
-      var j = store.get(STORE_JOIN);
-      if (j && j.code === urlRoom && Room.cleanName(j.name)) joinRoom(urlRoom, Room.cleanName(j.name));
-      else goToJoin(urlRoom);
-      return true;
-    }
+    var d = Room.rejoinDecision({
+      urlCode: urlRoom,
+      sessionJoin: store.get(STORE_JOIN),
+      savedJoin: local.getJSON(LOCAL_JOIN),
+      transport: TRANSPORT_KIND,
+      now: Date.now(),
+    });
+    if (d.action === 'rejoin') { joinRoom(d.code, d.name, { auto: d.source === 'saved', token: d.token }); return true; }
+    if (d.action === 'form') { goToJoin(d.code, '', d.name || null); return true; }
     return false;
+  }
+
+  /** Setup screen: "Resume room ABCD" (hosted here) and "Rejoin room ABCD" (played here). */
+  function renderResumeOffers() {
+    var box = $('resume-box');
+    box.textContent = '';
+    var t = Date.now();
+    var entries = [];
+    local.keys(LOCAL_ROOM).forEach(function (k) {
+      var e = local.getJSON(k);
+      // Forget rooms past the 12-hour window.
+      if (!e || !(t - e.savedAt < Room.RESUME_MAX_AGE_MS)) { local.remove(k); return; }
+      entries.push(e);
+    });
+    var best = Room.pickResumableRoom(entries, { transport: TRANSPORT_KIND, now: t });
+    if (best) {
+      var r = best.room;
+      var g = r.game;
+      var what = !g ? 'in the lobby' : 'song ' + (g.turn + 1) + (g.totalTurns ? ' of ' + g.totalTurns : '');
+      var names = r.players.map(function (p) { return p.name; });
+      box.appendChild(el('div', { class: 'resume-item' }, [
+        el('p', null, [
+          'You were hosting room ',
+          el('strong', { text: r.code }),
+          ' (' + what + (names.length ? ', ' + names.join(', ') : '') + ') ' + ago(best.savedAt) + '.',
+        ]),
+        el('div', { class: 'resume-actions' }, [
+          el('button', { type: 'button', class: 'btn btn-primary', id: 'resume-room-btn', text: 'Resume room ' + r.code, onclick: function () {
+            var room = Room.restoreRoom(local.getJSON(LOCAL_ROOM + r.code), { transport: TRANSPORT_KIND });
+            if (!room) { toast('That room can’t be resumed any more.'); renderResumeOffers(); return; }
+            resumeRoom(room);
+          } }),
+          el('button', { type: 'button', class: 'btn-link', text: 'Forget it', onclick: function () {
+            local.remove(LOCAL_ROOM + r.code);
+            renderResumeOffers();
+          } }),
+        ]),
+      ]));
+    }
+    var d = Room.rejoinDecision({ urlCode: '', sessionJoin: null, savedJoin: local.getJSON(LOCAL_JOIN), transport: TRANSPORT_KIND, now: t });
+    var offer = d.action === 'rejoin' ? { code: d.code, name: d.name, token: d.token } : d.offer;
+    if (offer) {
+      box.appendChild(el('div', { class: 'resume-item' }, [
+        el('p', null, ['You played in room ', el('strong', { text: offer.code }), ' as ' + offer.name + '.']),
+        el('div', { class: 'resume-actions' }, [
+          el('button', { type: 'button', class: 'btn btn-primary', id: 'rejoin-room-btn', text: 'Rejoin room ' + offer.code, onclick: function () {
+            joinRoom(offer.code, offer.name, { token: offer.token });
+          } }),
+          el('button', { type: 'button', class: 'btn-link', text: 'Forget it', onclick: function () {
+            local.remove(LOCAL_JOIN);
+            renderResumeOffers();
+          } }),
+        ]),
+      ]));
+    }
+    box.hidden = !box.children.length;
+  }
+
+  function ago(ts) {
+    var min = Math.max(0, Math.round((Date.now() - ts) / 60000));
+    if (min < 1) return 'just now';
+    if (min < 60) return min + ' min ago';
+    var h = Math.round(min / 60);
+    return h + ' hour' + (h === 1 ? '' : 's') + ' ago';
   }
 
   function restore() {
@@ -1720,6 +2036,12 @@
       joined.ctl.retry();
     });
     $('pw-setup').addEventListener('click', function (e) { e.preventDefault(); goToSetup(); });
+    $('pw-notyou').addEventListener('click', function () {
+      if (!joined) return;
+      var code = joined.code;
+      goToJoin(code, '', ''); // leaves the room (the saved one is kept, marked "left")
+      $('join-name').focus();
+    });
     $('leave-room-btn').addEventListener('click', onLeaveClick);
     $('over-leave-btn').addEventListener('click', goToSetup);
 
@@ -1731,18 +2053,36 @@
       if (joined) joined.ctl.leave();
     });
     window.addEventListener('pageshow', function (e) {
-      if (!e.persisted) return; // back/forward cache: reconnect
+      if (!e.persisted) { onWake('pageshow'); return; }
+      // Back/forward cache: pagehide closed the connections, start over.
       if (hosting) { hosting.attempts = 0; connectHost(); }
       if (joined) joined.ctl.retry();
     });
-    document.addEventListener('visibilitychange', function () { if (wantAwake) keepAwake(true); });
+    // Mobile browsers freeze background tabs and drop their connections. Coming
+    // back (or getting the network back), check and reconnect at once.
+    document.addEventListener('visibilitychange', function () {
+      if (document.visibilityState === 'visible') onWake('visible');
+      else hiddenAt = Date.now();
+    });
+    window.addEventListener('focus', function () { onWake('focus'); });
+    window.addEventListener('online', function () { onWake('online'); });
+    window.addEventListener('offline', function () { renderHostConn(); });
+    // Another tab resumed the room this tab hosts: the newer one wins.
+    window.addEventListener('storage', function (e) {
+      if (!hosting || !e.key || e.key !== LOCAL_ROOM + hosting.room.code || !e.newValue) return;
+      var other;
+      try { other = JSON.parse(e.newValue); } catch (x) { return; }
+      if (other && other.owner && other.owner !== TAB_ID && other.claimedAt > hosting.claimedAt) yieldRoom();
+    });
     document.addEventListener('keydown', function (e) {
       if (!game || game.phase !== 'round') return;
       if (e.target && /input|textarea|select/i.test(e.target.tagName)) return;
       if (e.key === ' ' || e.key === 'k') { e.preventDefault(); onPlayClick(); }
     });
 
-    if (!restoreRoom() && !restore()) goToSetup();
+    var restored = false;
+    try { restored = restoreRoom() || restore(); } catch (e) { if (window.console) console.error(e); }
+    if (!restored) goToSetup();
   }
 
   init();
