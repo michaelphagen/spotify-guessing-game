@@ -7,6 +7,9 @@
  * Spotify embed page is fetched through public CORS proxies and parsed in the
  * browser with the same parser the server uses. Cover art comes from Spotify's
  * oEmbed endpoint, which allows cross-origin requests.
+ * Example playlist: its track list is bundled with the game as a JSON snapshot
+ * (config EXAMPLE_URL / EXAMPLE_SNAPSHOT, made by `npm run snapshot`) and is
+ * served from there in either mode, falling back to the live playlist.
  *
  * Shared by the browser (window.TrackSource) and the Node tests. All I/O goes
  * through injected dependencies.
@@ -20,6 +23,8 @@
   var CACHE_TTL_MS = 10 * 60 * 1000;
   var STORE_NO_BACKEND = 'gts:no-backend';
   var STORE_PROXY = 'gts:proxy';
+  var DEFAULT_EXAMPLE_URL = 'https://open.spotify.com/playlist/6i2Qd6OpeRBAzxfscNXeWp';
+  var DEFAULT_EXAMPLE_SNAPSHOT = 'data/example-playlist.json';
 
   /**
    * Resolve the backend base URL. Returns 'none' (static mode only), '' (same
@@ -47,6 +52,50 @@
     return template.split('{url}').join(encodeURIComponent(target)).split('{raw}').join(target);
   }
 
+  function isHttpsUrl(v) {
+    return typeof v === 'string' && /^https:\/\/[^\s]+$/i.test(v);
+  }
+
+  /**
+   * Check a bundled snapshot ({ source, tracks, snapshotAt }) against the
+   * { type, id } it should hold. Returns { source, tracks, skipped, snapshotAt }
+   * with only well-formed, de-duplicated tracks, or null if it doesn't fit.
+   */
+  function validateSnapshot(data, ref, SpotifyUrl) {
+    if (!data || typeof data !== 'object' || !data.source || !Array.isArray(data.tracks)) return null;
+    var src = data.source;
+    var srcRef;
+    try { srcRef = SpotifyUrl.parseSpotifyInput(String(src.url || '')); } catch (e) { return null; }
+    if (!ref || srcRef.type !== ref.type || srcRef.id !== ref.id) return null;
+    var seen = {};
+    var tracks = [];
+    data.tracks.forEach(function (t) {
+      if (!t || typeof t !== 'object') return;
+      if (typeof t.id !== 'string' || !t.id || seen[t.id]) return;
+      if (typeof t.title !== 'string' || !t.title || !isHttpsUrl(t.previewUrl)) return;
+      seen[t.id] = true;
+      tracks.push({
+        id: t.id,
+        title: t.title,
+        artist: typeof t.artist === 'string' ? t.artist : '',
+        previewUrl: t.previewUrl,
+        image: isHttpsUrl(t.image) ? t.image : null,
+      });
+    });
+    if (!tracks.length) return null;
+    return {
+      source: {
+        type: srcRef.type,
+        name: typeof src.name === 'string' && src.name ? src.name : 'Example ' + srcRef.type,
+        image: isHttpsUrl(src.image) ? src.image : null,
+        url: 'https://open.spotify.com/' + srcRef.type + '/' + srcRef.id,
+      },
+      tracks: tracks,
+      skipped: 0,
+      snapshotAt: typeof data.snapshotAt === 'string' ? data.snapshotAt : null,
+    };
+  }
+
   function typeWord(ref) {
     return ref && ref.type ? ref.type : 'link';
   }
@@ -70,6 +119,11 @@
     var proxies = Array.isArray(config.CORS_PROXIES) ? config.CORS_PROXIES.filter(function (p) { return p && p.url; }) : [];
     var timeoutMs = Number(config.PROXY_TIMEOUT_MS) > 0 ? Number(config.PROXY_TIMEOUT_MS) : 12000;
     var cache = new Map();
+    var exampleUrl = typeof config.EXAMPLE_URL === 'string' && config.EXAMPLE_URL ? config.EXAMPLE_URL : DEFAULT_EXAMPLE_URL;
+    var exampleSnapshot = typeof config.EXAMPLE_SNAPSHOT === 'string' ? config.EXAMPLE_SNAPSHOT : DEFAULT_EXAMPLE_SNAPSHOT;
+    var exampleRef = null;
+    try { exampleRef = SpotifyUrl.parseSpotifyInput(exampleUrl); } catch (e) { exampleRef = null; }
+    var snapshotPromise = null;
 
     function sget(key) { try { return storage ? storage.getItem(key) : null; } catch (e) { return null; } }
     function sset(key, v) { try { if (storage) storage.setItem(key, v); } catch (e) { /* ignore */ } }
@@ -205,11 +259,48 @@
       });
     }
 
+    /** { type, id } when `input` is the example playlist (and a snapshot is configured), else null. */
+    function exampleRefFor(input) {
+      if (!exampleRef || !exampleSnapshot) return null;
+      var ref;
+      try { ref = SpotifyUrl.parseSpotifyInput(String(input || '')); } catch (e) { return null; }
+      return ref.type === exampleRef.type && ref.id === exampleRef.id ? ref : null;
+    }
+
+    /**
+     * The bundled example snapshot (a relative path, so it works under a
+     * sub-path). Resolves to the track list, or null when it can't be used;
+     * a failed load is retried on the next call.
+     */
+    function loadSnapshot(ref) {
+      if (!snapshotPromise) {
+        snapshotPromise = Promise.resolve()
+          .then(function () { return fetchImpl(exampleSnapshot, { headers: { Accept: 'application/json' } }); })
+          .then(function (res) { return res.ok ? res.json() : null; })
+          .then(function (data) { return validateSnapshot(data, ref, SpotifyUrl); })
+          .catch(function () { return null; })
+          .then(function (value) {
+            if (!value) snapshotPromise = null;
+            return value;
+          });
+      }
+      return snapshotPromise.then(function (value) {
+        return value ? Object.assign({}, value, { via: 'snapshot' }) : null;
+      });
+    }
+
     /**
      * Load { source, tracks, skipped, via } for a Spotify link. Rejects with an
-     * Error whose message is safe to show to the player.
+     * Error whose message is safe to show to the player. The example playlist
+     * comes from its bundled snapshot when that loads (via: 'snapshot').
      */
     function loadTracks(input) {
+      var ref = exampleRefFor(input);
+      if (!ref) return loadLive(input);
+      return loadSnapshot(ref).then(function (snap) { return snap || loadLive(input); });
+    }
+
+    function loadLive(input) {
       return callBackend('api/tracks?url=' + encodeURIComponent(String(input || ''))).then(function (r) {
         // A backend was configured explicitly (API_BASE or ?api=) but didn't answer.
         if (!r) return loadStatic(input, base !== '' && base !== 'none');
@@ -244,10 +335,14 @@
     return {
       loadTracks: loadTracks,
       coverUrl: coverUrl,
+      exampleUrl: function () { return exampleUrl; },
+      isExample: function (input) { return !!exampleRefFor(input); },
+      /** The example's bundled snapshot only (never Spotify); resolves to null if unavailable. */
+      loadExampleSnapshot: function () { return exampleRef && exampleSnapshot ? loadSnapshot(exampleRef) : Promise.resolve(null); },
       mode: function () { return backend === 'yes' ? 'server' : backend === 'no' ? 'static' : 'unknown'; },
       apiBase: function () { return base; },
     };
   }
 
-  return { create: create, resolveApiBase: resolveApiBase, fillTemplate: fillTemplate };
+  return { create: create, resolveApiBase: resolveApiBase, fillTemplate: fillTemplate, validateSnapshot: validateSnapshot };
 });

@@ -43,4 +43,14 @@ window.GTS_CONFIG = {
 
   /* Give up on a proxy after this many milliseconds and try the next one. */
   PROXY_TIMEOUT_MS: 12000,
+
+  /*
+   * The "Use an example playlist" button. Its track list is bundled with the
+   * game in EXAMPLE_SNAPSHOT (made by `npm run snapshot`), so the example loads
+   * without a backend or proxy. The snapshot is used whenever the link entered
+   * is this playlist; if the file is missing or is of another playlist, the
+   * game loads the playlist from Spotify as usual.
+   */
+  EXAMPLE_URL: 'https://open.spotify.com/playlist/6i2Qd6OpeRBAzxfscNXeWp',
+  EXAMPLE_SNAPSHOT: 'data/example-playlist.json',
 };

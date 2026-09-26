@@ -15,7 +15,8 @@
     search: window.location.search,
     storage: sessionStore,
   });
-  var EXAMPLE_URL = 'https://open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M';
+  // The example playlist's songs are bundled with the game (data/example-playlist.json).
+  var EXAMPLE_URL = tracksSource.exampleUrl();
   var STORE_GAME = 'gts:game';
   var STORE_SETUP = 'gts:setup';
   var STORE_USED = 'gts:used';
@@ -318,6 +319,29 @@
     var used = key ? getUsed(key) : [];
     $('exclude-wrap').hidden = !used.length;
     $('used-count').textContent = String(used.length);
+    refreshExampleNote();
+  }
+
+  // Name the example playlist under the link field while it is selected.
+  var exampleName = '';
+  var exampleNameTried = false;
+  function refreshExampleNote() {
+    var note = $('example-note');
+    var on = tracksSource.isExample($('url-input').value);
+    note.hidden = !on;
+    if (!on) return;
+    note.textContent = exampleName
+      ? 'Example: “' + exampleName + '” (songs saved with the game).'
+      : 'Example playlist (songs saved with the game).';
+    if (!exampleName && !exampleNameTried) {
+      exampleNameTried = true;
+      tracksSource.loadExampleSnapshot().then(function (data) {
+        if (data && data.source && data.source.name) {
+          exampleName = data.source.name;
+          refreshExampleNote();
+        }
+      }, function () { /* the note stays generic */ });
+    }
   }
   function normalizeUrlKey(u) {
     var m = /(playlist|album|track)[/:]([A-Za-z0-9]{10,40})/.exec(u || '');
@@ -338,7 +362,9 @@
     setupError('');
     if (!setup.url) { setupError('Paste a Spotify playlist, album or track link to start.'); $('url-input').focus(); return; }
     store.set(STORE_SETUP, setup);
-    $('loading-text').textContent = tracksSource.mode() === 'static'
+    $('loading-text').textContent = tracksSource.isExample(setup.url)
+      ? 'Loading the example playlist…'
+      : tracksSource.mode() === 'static'
       ? 'Loading songs from Spotify through a public proxy…'
       : 'Loading songs from Spotify…';
     showScreen('loading');

@@ -19,9 +19,23 @@ Requires Node 18 or newer.
 npm install
 npm start            # http://localhost:3000  (set PORT to change)
 npm test             # node:test unit + API tests (offline, fixture based)
+npm run snapshot     # refresh the bundled example playlist (see below)
 ```
 
 To play on phones on the same Wi-Fi network, open `http://<your-computer-ip>:3000`.
+
+## Example playlist
+
+The **Use an example playlist** button fills in [Top 100 Greatest Songs of All Time](https://open.spotify.com/playlist/6i2Qd6OpeRBAzxfscNXeWp). Its track list is **bundled with the game** in `public/data/example-playlist.json`, so the example starts instantly, needs no backend or CORS proxy, and keeps working if the playlist on Spotify changes or is deleted. Pasting that playlist's link by hand uses the bundled copy too; every other link loads from Spotify as usual. If the bundled file can't be loaded, the game falls back to loading the playlist live.
+
+The file is a **snapshot**: it holds each track's id, title, artist, 30-second preview URL and cover URL (all on Spotify's CDN), plus the date it was taken (`snapshotAt`). It doesn't follow later changes to the playlist. To refresh it:
+
+```bash
+npm run snapshot                                   # re-snapshot the example playlist
+npm run snapshot -- https://open.spotify.com/playlist/<id>   # snapshot another playlist instead
+```
+
+The script (`scripts/snapshot-playlist.js`) uses the server's embed-page fetch, so it needs internet access; covers come from Spotify's oEmbed endpoint. It always writes `public/data/example-playlist.json`. If you snapshot a different playlist, also set `EXAMPLE_URL` in `public/config.js` to its link (the script reminds you); the game only uses the snapshot for the link it was taken from. Behind an HTTPS proxy, run it with `NODE_USE_ENV_PROXY=1` (Node 22.21+ or 24+). If a bundled song ever stops playing (Spotify can retire preview files), re-run the snapshot.
 
 ## Deploy to GitHub Pages
 
@@ -112,15 +126,19 @@ server/
   embed.js        server-side embed page fetch (uses public/lib/embed-parser.js)
 public/
   index.html, styles.css
-  config.js       API_BASE and the CORS proxy list for static mode
+  config.js       API_BASE, the CORS proxy list for static mode, the example playlist
+  data/
+    example-playlist.json   bundled snapshot of the example playlist
   lib/
     spotify-url.js    link / URI parsing and validation (browser + server)
     embed-parser.js   __NEXT_DATA__ parser (browser + server)
-    track-source.js   backend detection, CORS-proxy fallback, cover lookup
+    track-source.js   bundled example, backend detection, CORS-proxy fallback, cover lookup
   game-logic.js   pure game rules (matching, options, turns, scoring), also used by tests
   app.js          UI controller, clip player, sessionStorage persistence
+scripts/
+  snapshot-playlist.js   `npm run snapshot`: saves a playlist to public/data/example-playlist.json
 test/
-  *.test.js       node:test suites (URL parsing, parser, track source, game logic, HTTP API)
+  *.test.js       node:test suites (URL parsing, parser, track source, example snapshot, game logic, HTTP API)
   fixtures/       captured embed pages (trimmed; session tokens removed)
 render.yaml       Render Blueprint for the optional backend
 .github/workflows/deploy.yml   GitHub Pages deployment
