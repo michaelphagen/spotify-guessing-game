@@ -8,6 +8,7 @@ A pass-the-phone party game. Paste a Spotify playlist (or album or track) link. 
 - **Scoring:** 10 points for a correct answer after the 5-second clip, 5 points after the extra 10 seconds, and 0 for a wrong or revealed answer.
 - **Players:** 1 to 12. Turns rotate, and the scoreboard is always visible.
 - **Rounds:** 1, 3, 5 or 10 (each round gives every player one song), or play until the songs run out.
+- **Clip start:** from the beginning of the preview (default), or a random spot each song (0–15s in) so the intro alone isn't always the giveaway.
 - **No repeats:** a song is never played twice in a session. "Play again" can keep excluding songs you've already heard.
 - **Reloads are safe:** the game state lives in `sessionStorage`.
 

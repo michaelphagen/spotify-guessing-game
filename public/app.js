@@ -208,8 +208,19 @@
 
   var game = null;
   var turnUi = { heard: 0, playedOnce: false, audioError: false };
+
+  /**
+   * Where the current song's clip actually starts, in seconds into the preview.
+   * Fitted to the preview's real duration once it is known (see
+   * GameLogic.clampClipStart); until then the stored offset is used as-is.
+   */
+  function clipOffset() {
+    if (!game || !game.current) return 0;
+    return G.clampClipStart(game.current.clipStart, player.audio.duration);
+  }
+
   var player = new ClipPlayer({
-    onProgress: function (t) { if (game && game.phase === 'round') renderProgress(t); },
+    onProgress: function (t) { if (game && game.phase === 'round') renderProgress(t - clipOffset()); },
     onState: function (s) { onPlayerState(s); },
     onError: function (msg) {
       if (!game || game.phase !== 'round') { toast(msg); return; }
@@ -289,12 +300,14 @@
 
   function readSetup() {
     var modeInput = document.querySelector('input[name="mode"]:checked');
+    var clipStartInput = document.querySelector('input[name="clip-start"]:checked');
     return {
       url: $('url-input').value.trim(),
       players: readPlayers(),
       rawPlayers: Array.prototype.map.call($('player-list').querySelectorAll('input'), function (i) { return i.value; }),
       mode: modeInput ? modeInput.value : 'choice',
       rounds: parseInt($('rounds-select').value, 10) || 0,
+      clipStart: clipStartInput ? clipStartInput.value : 'beginning',
     };
   }
 
@@ -305,6 +318,8 @@
     if (m) m.checked = true;
     var sel = $('rounds-select');
     if (s.rounds != null && sel.querySelector('option[value="' + s.rounds + '"]')) sel.value = String(s.rounds);
+    var c = document.querySelector('input[name="clip-start"][value="' + (s.clipStart === 'random' ? 'random' : 'beginning') + '"]');
+    if (c) c.checked = true;
   }
 
   function setupError(msg) {
@@ -406,6 +421,7 @@
       players: setup.players,
       mode: mode,
       rounds: setup.rounds,
+      clipStartMode: setup.clipStart === 'random' ? 'random' : 'beginning',
       tracks: data.tracks,
       usedIds: used,
       source: { type: data.source.type, name: data.source.name, image: data.source.image, key: key },
@@ -531,8 +547,9 @@
     btn.classList.toggle('loading', s === 'loading');
     var cur = game.current;
     var status = $('clip-status');
+    var playingExtension = cur.extended && Math.round(player.segStart - clipOffset()) > 0;
     if (s === 'loading') status.textContent = 'Loading…';
-    else if (s === 'playing') status.textContent = cur.extended && player.segStart > 0 ? 'Playing seconds 5–15' : 'Playing…';
+    else if (s === 'playing') status.textContent = playingExtension ? 'Playing seconds 5–15' : 'Playing…';
     else {
       if (turnUi.heard > 0) turnUi.playedOnce = true;
       status.textContent = !turnUi.playedOnce
@@ -556,7 +573,8 @@
     var cur = game.current;
     reloadAfterError();
     turnUi.heard = 0;
-    player.play(0, cur.extended ? G.CLIP_LONG : G.CLIP_SHORT);
+    var off = clipOffset();
+    player.play(off, off + (cur.extended ? G.CLIP_LONG : G.CLIP_SHORT));
   }
 
   function onExtendClick() {
@@ -567,7 +585,8 @@
     renderExtendState();
     reloadAfterError();
     turnUi.heard = G.CLIP_SHORT;
-    player.play(G.CLIP_SHORT, G.CLIP_LONG);
+    var off = clipOffset();
+    player.play(off + G.CLIP_SHORT, off + G.CLIP_LONG);
   }
 
   function submit(kind, value) {

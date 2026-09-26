@@ -49,6 +49,15 @@
           </div>
         </fieldset>
 
+        <fieldset class="field">
+          <legend>Clip start</legend>
+          <div class="segmented" role="radiogroup">
+            <label><input type="radio" name="clip-start" value="beginning" checked><span>From the beginning</span></label>
+            <label><input type="radio" name="clip-start" value="random"><span>Random spot</span></label>
+          </div>
+          <p class="hint">"Random spot" plays 5 (then 10 more) seconds from a random point in the preview instead of the very start.</p>
+        </fieldset>
+
         <div class="field">
           <label for="rounds-select">Rounds</label>
           <select id="rounds-select" name="rounds">

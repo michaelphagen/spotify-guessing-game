@@ -11,6 +11,34 @@
   var CLIP_SHORT = 5; // seconds heard first
   var CLIP_LONG = 15; // seconds heard after "play next 10 seconds"
   var POINTS = { short: 10, extended: 5 };
+  var MAX_CLIP_START = 15; // "random spot" offsets are 0..15s, so offset+15 always fits a 30s preview
+
+  // ---------- Clip start (where in the preview the clip begins) ----------
+
+  /**
+   * Pick where a song's clip should start within its preview.
+   * 'beginning' (or anything else) always starts at 0. 'random' picks a whole
+   * second in [0, MAX_CLIP_START] so the 15-second clip still fits a 30s preview.
+   */
+  function pickClipStart(mode, rng) {
+    rng = rng || Math.random;
+    if (mode === 'random') return Math.floor(rng() * (MAX_CLIP_START + 1));
+    return 0;
+  }
+
+  /**
+   * Fit a clip start offset to the preview's actual duration. When the duration
+   * isn't known yet (not finite/positive), the offset is returned unchanged —
+   * previews are normally 30s, so this only matters once metadata has loaded.
+   * A preview too short to fit any 15-second clip falls back to 0.
+   */
+  function clampClipStart(offset, duration) {
+    offset = offset || 0;
+    if (!isFinite(duration) || duration <= 0) return offset;
+    var maxStart = Math.floor(duration - CLIP_LONG);
+    if (maxStart <= 0) return 0;
+    return Math.min(offset, maxStart);
+  }
 
   // ---------- Text normalisation & fuzzy matching ----------
 
@@ -223,6 +251,7 @@
    * @param {Array} cfg.tracks        tracks from /api/tracks
    * @param {string[]} [cfg.usedIds]  ids already played this session
    * @param {object} [cfg.source]
+   * @param {'beginning'|'random'} [cfg.clipStartMode]
    */
   function createGame(cfg) {
     var used = (cfg.usedIds || []).slice();
@@ -236,6 +265,7 @@
       source: cfg.source || null,
       sourceUrl: cfg.sourceUrl || '',
       mode: cfg.mode === 'free' ? 'free' : 'choice',
+      clipStartMode: cfg.clipStartMode === 'random' ? 'random' : 'beginning',
       rounds: rounds,
       totalTurns: rounds ? rounds * players.length : null,
       players: players,
@@ -282,7 +312,8 @@
     if (game.mode === 'choice' && optionCount >= 2) {
       options = buildOptions(track, game.tracks, optionCount, rng, game.usedIds);
     }
-    game.current = { trackId: id, extended: false, options: options, answered: false, outcome: null, points: 0, guess: '' };
+    var clipStart = pickClipStart(game.clipStartMode, rng);
+    game.current = { trackId: id, extended: false, options: options, answered: false, outcome: null, points: 0, guess: '', clipStart: clipStart };
     game.phase = 'round';
     return game.current;
   }
@@ -348,7 +379,10 @@
   return {
     CLIP_SHORT: CLIP_SHORT,
     CLIP_LONG: CLIP_LONG,
+    MAX_CLIP_START: MAX_CLIP_START,
     POINTS: POINTS,
+    pickClipStart: pickClipStart,
+    clampClipStart: clampClipStart,
     basicNormalize: basicNormalize,
     stripDecorations: stripDecorations,
     titleVariants: titleVariants,

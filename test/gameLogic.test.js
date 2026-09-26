@@ -184,3 +184,43 @@ test('multiple-choice distractors prefer songs that have not been played yet', (
   assert.equal(opts.length, 4);
   assert.ok(opts.some((o) => o.id === 't4'));
 });
+
+test('pickClipStart: "beginning" is always 0, "random" is an integer in [0, 15]', () => {
+  const rng = seeded(11);
+  for (let i = 0; i < 50; i++) {
+    assert.equal(G.pickClipStart('beginning', rng), 0);
+    assert.equal(G.pickClipStart(undefined, rng), 0, 'unknown mode defaults to the beginning');
+  }
+  const seen = new Set();
+  for (let i = 0; i < 300; i++) {
+    const off = G.pickClipStart('random', rng);
+    assert.ok(Number.isInteger(off), 'offset is a whole number of seconds');
+    assert.ok(off >= 0 && off <= 15, 'offset + 15 fits a 30s preview: ' + off);
+    seen.add(off);
+  }
+  assert.ok(seen.size > 1, 'random mode actually varies');
+  assert.ok(seen.has(0) && seen.has(15), 'both ends of the range are reachable: ' + [...seen].sort((a, b) => a - b));
+});
+
+test('clampClipStart fits an offset to the preview\'s real duration', () => {
+  assert.equal(G.clampClipStart(9, 30), 9, 'fits as-is inside a normal 30s preview');
+  assert.equal(G.clampClipStart(9, NaN), 9, 'duration unknown yet: offset passed through unchanged');
+  assert.equal(G.clampClipStart(9, 0), 9, 'duration unknown (0): offset passed through unchanged');
+  assert.equal(G.clampClipStart(9, -1), 9, 'duration unknown (negative): offset passed through unchanged');
+  assert.equal(G.clampClipStart(9, 20), 5, 'clamped so offset + 15 fits a shorter preview');
+  assert.equal(G.clampClipStart(0, 20), 0, 'an offset of 0 already fits');
+  assert.equal(G.clampClipStart(9, 10), 0, 'preview too short for any 15s clip: falls back to 0');
+  assert.equal(G.clampClipStart(undefined, 30), 0, 'a missing offset defaults to 0');
+});
+
+test('startTurn stores a clipStart on the current turn, driven by the game\'s clipStartMode', () => {
+  const tracks = Array.from({ length: 5 }, (_, i) => T('t' + i, 'Song ' + i, 'X'));
+  const beginningGame = G.createGame({ players: ['A'], mode: 'free', rounds: 0, tracks });
+  G.startTurn(beginningGame);
+  assert.equal(beginningGame.current.clipStart, 0);
+
+  const randomGame = G.createGame({ players: ['A'], mode: 'free', rounds: 0, tracks, clipStartMode: 'random', rng: seeded(4) });
+  G.startTurn(randomGame, seeded(5));
+  assert.ok(Number.isInteger(randomGame.current.clipStart));
+  assert.ok(randomGame.current.clipStart >= 0 && randomGame.current.clipStart <= 15);
+});
