@@ -327,3 +327,24 @@ select { appearance: none; background-image: linear-gradient(45deg, transparent 
 #screen-pwait .turn-player { font-size: clamp(1.6rem, 7vw, 2.2rem); }
 .notice.bad { background: var(--danger-soft); color: var(--danger); border-color: rgba(255, 107, 107, .35); }
 .standings li.you .n { text-decoration: underline; text-decoration-color: var(--accent); text-underline-offset: 4px; }
+
+/* ---------- Sound: previews or full songs via Spotify ---------- */
+.segmented-stack span { display: flex; flex-direction: column; gap: 2px; height: 100%; }
+.segmented span small { font-weight: 500; font-size: 0.78rem; line-height: 1.3; color: var(--muted); }
+.sp-panel {
+  display: flex; flex-direction: column; gap: 12px; padding: 14px;
+  border-radius: 12px; background: rgba(255, 255, 255, 0.025); border: 1px solid var(--border);
+}
+.sp-signed-out, .sp-signed-in { display: flex; flex-direction: column; gap: 10px; }
+.sp-account { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.sp-account strong { overflow-wrap: anywhere; }
+.btn-spotify { background: var(--accent); color: var(--accent-ink); align-self: flex-start; }
+.btn-spotify:hover:not(:disabled) { background: #3be477; }
+.sp-panel select, .device-row select { min-width: 0; flex: 1; }
+.sp-status.bad { color: var(--danger); }
+.sp-status.ok { color: var(--accent); }
+.device-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; font-size: 0.9rem; }
+.device-row label { font-weight: 600; font-size: 0.9rem; color: var(--muted); }
+.device-row select { min-height: 40px; padding: 6px 34px 6px 12px; }
+#sp-client-id { color: var(--text); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.sp-other-app { align-self: flex-start; }

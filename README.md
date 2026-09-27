@@ -8,7 +8,8 @@ A pass-the-phone party game. Paste a Spotify playlist (or album or track) link. 
 - **Scoring:** 10 points for a correct answer after the 5-second clip, 5 points after the extra 10 seconds, and 0 for a wrong or revealed answer.
 - **Players:** 1 to 12. Turns rotate, and the scoreboard is always visible.
 - **Rounds:** 1, 3, 5 or 10 (each round gives every player one song), or play until the songs run out.
-- **Clip start:** from the beginning of the preview (default), or a random spot each song (0–15s in) so the intro alone isn't always the giveaway.
+- **Clip start:** from the beginning (default), or a random spot each song so the intro alone isn't always the giveaway.
+- **Sound:** 30-second previews (default, no sign-in), or **full songs via Spotify** so "from the beginning" really is the start of the song (host signs in with Spotify; Premium needed to play). See [Full songs with Spotify](#full-songs-with-spotify).
 - **No repeats:** a song is never played twice in a session. "Play again" can keep excluding songs you've already heard.
 - **Reloads are safe:** the game state lives in `sessionStorage`. A hosted room is also kept in `localStorage` for 12 hours, so it can be resumed after the tab is closed (see [Multiplayer rooms](#multiplayer-rooms)).
 - **Multiplayer rooms:** instead of passing one phone around, one device can host a room that everyone joins with their own phone (see [Multiplayer rooms](#multiplayer-rooms)).
@@ -64,6 +65,46 @@ Besides pass-the-phone (**Start game**), the setup screen has **Host a room** an
 - Up to 12 players per room.
 
 **Same-device dev mode:** add `?transport=local` to the URL (for example `http://localhost:3000/?transport=local`) and open the host and the players in **tabs of the same browser**. Messages then go over a `BroadcastChannel` instead of PeerJS, with no network needed. Join links made in this mode keep the parameter. The automated tests use this mode, and it's handy for development.
+
+## Full songs with Spotify
+
+**Why.** Without an account the game plays Spotify's 30-second **previews**. A preview is a snippet Spotify picks, usually the chorus, so "from the beginning" means the beginning of the *preview*, which is mid-song. With **Sound → Full songs via Spotify**, the host signs in with Spotify and the game plays the real songs through Spotify Connect: "from the beginning" is 0:00 of the song, and "random spot" can be anywhere in it. Previews stay the default and need no sign-in.
+
+**What you need.** A Spotify account with **Premium** for the host (Spotify only allows playback control and in-browser playback for Premium accounts), and a Spotify app of your own for the Client ID. Players don't need anything: only the host device plays audio, also in rooms.
+
+### One-time setup: create a Spotify app
+
+The live site is already set up with the owner's app; these steps are for the owner (to add users), for forks, and for hosts who want their own app.
+
+
+1. Open **https://developer.spotify.com/dashboard**, log in, and choose **Create app**.
+2. Give it any name and description. Under **Redirect URIs** add exactly:
+   - `https://michaelphagen.github.io/spotify-guessing-game/` (the live site; use your own Pages URL for a fork), and
+   - `http://127.0.0.1:3000/` for local development (`npm start`). Spotify no longer accepts `http://localhost` redirect URIs; open the game at `http://127.0.0.1:3000/` rather than `localhost` when you want to sign in locally.
+   Under **Which API/SDKs are you planning to use?** tick **Web API** and **Web Playback SDK**. Save.
+3. Copy the app's **Client ID** (32 characters; the client secret is *not* needed and must not be put in the site).
+4. Put it in `SPOTIFY_CLIENT_ID` in `public/config.js`. **The live site already has one** (`a010d85057d64fdfabe0fb42155cacba`, the site owner's app), so on https://michaelphagen.github.io/spotify-guessing-game/ you can just press **Sign in with Spotify**. A host who wants to use their own app instead (for example because the site's app is limited to the users on its list, see step 5) opens **Use a different Spotify app** on the setup screen and pastes their Client ID; it overrides the default in that browser only (`localStorage`) until **Use this site's app instead**. With `SPOTIFY_CLIENT_ID: ''` the field is always shown.
+5. **Development Mode user list.** New Spotify apps are in Development Mode: only the app's owner and the users added under **User Management** in the dashboard can sign in (up to **5** users for apps created or migrated since February 2026; older apps may still show 25). Only the host signs in, so add the Spotify account(s) of whoever hosts. Since February 2026 Spotify also requires the owner of a Development Mode app to have Premium.
+
+### Playing
+
+- **Sign in.** On the setup screen pick **Sound → Full songs via Spotify** and press **Sign in with Spotify**. Spotify asks you to allow the app, then sends you back to the game. Sign-in uses the Authorization Code flow with PKCE entirely in the browser (no backend, no client secret), so it works on GitHub Pages. Scopes: `streaming user-read-email user-read-private user-modify-playback-state user-read-playback-state playlist-read-private playlist-read-collaborative`. The redirect URI is the page's own address (origin + path, so the `/spotify-guessing-game/` sub-path works). Room parameters (`?room=`, `?host=`, `?api=`, `?transport=`) travel through the OAuth `state` and are restored afterwards, so signing in again in the middle of a hosted game returns to the same room.
+- **Pick a device** under **Play on**. The list comes from Spotify Connect (`GET /me/player/devices`): the Spotify app on your phone or computer, speakers, TVs, and **Guess the Song (this browser)**, which is this page itself (registered with Spotify's Web Playback SDK, loaded only after sign-in). If your phone or speaker isn't listed, open Spotify on it and press **Refresh**. **Test sound** plays a second and a half of music on the chosen device. The choice is remembered, and during a game the round screen has a **Plays on** menu for switching devices.
+- **Songs.** With full songs the track list comes from the Spotify Web API: every song of an album, and every song of a playlist **you own or collaborate on** (paged 50 at a time, so the ~100-song cap of the embed page doesn't apply). Spotify's February 2026 rules only let Development Mode apps read the contents of the signed-in user's own playlists; for any other playlist (including the example) the game uses the public embed page as before (up to ~100 songs) and plays those songs in full. Local files and songs that aren't playable in your country are skipped. Tip: to play someone else's big playlist in full, add it to a playlist of your own in Spotify.
+- **Playback and timing.** Each clip is `PUT /me/player/play?device_id=…` with the song's URI and `position_ms` (0 for "from the beginning", the clip's random start otherwise), and a pause at start + 5 s (or, for "next 10 seconds", play at start + 5 s and pause at start + 15 s). The pause is scheduled from the moment the play request resolves, minus half the play request's round trip (the pause request's own travel time), and the device's position is read back once about 1.2 s in (`GET /me/player`) to correct for a device that starts late. After pausing, the real position is read back and shown. With a phone, computer or speaker (Spotify Connect over the internet, 200–600 ms per request), expect clips to end within about **±0.25 s** of the mark, more on a slow connection. With **this browser** as the device the SDK's local player state is polled every 100 ms and the local pause takes effect in about 50 ms, so clips end within about **±0.1 s**.
+- **Random spot** with full songs picks a whole second between 0 and the song's length minus 20 s (the 15-second clip plus 5 s), so it never runs past the end. It's chosen by the host, once per song.
+- **Result screen:** **Play the song** plays it from the start (with **Pause**); **Open in Spotify** is still there.
+- **Rooms:** only the host plays audio, so the sound setting and device are the host's. Phones see the clip's progress as before. Room snapshots never contain the current song's URI or title before the turn is resolved (the URI would reveal the track id). The saved room (for **Resume room**) remembers the sound setting and the device.
+
+### When something goes wrong
+
+- **"Full-song playback needs Spotify Premium"** (Spotify answers 403): the game switches to previews, looks up the previews of the loaded songs (songs without one are taken out) and carries on.
+- **"No active Spotify device"** (404): open Spotify on the chosen device, or pick another one under **Plays on**, and tap play again.
+- **Expired sign-in:** access tokens are refreshed automatically with the refresh token (and a 401 is retried once with a fresh token). If the refresh fails, a banner offers **Sign in again**; the game is saved and continues where it was.
+- **Rate limits** (429): requests wait for `Retry-After` (up to 30 s) and are retried.
+- **iOS Safari** (and some other mobile browsers) can't run the Web Playback SDK, so "this browser" isn't offered there. Pick the phone's own Spotify app (or any other device) instead; the game then controls it over Spotify Connect. Headless and DRM-less browsers can't use the in-browser player either.
+
+**Privacy.** Tokens (access and refresh) and the Client ID are stored only in this browser's `localStorage` (`gts:sp:*` keys) and are sent only to Spotify (`accounts.spotify.com`, `api.spotify.com`, and the Web Playback SDK from `sdk.scdn.co`). **Sign out** removes them. There's no server of ours involved, and players' phones never receive them.
 
 ## Example playlist
 
@@ -125,7 +166,7 @@ If the configured backend can't be reached (a free Render service may take up to
 
 ## How audio is sourced
 
-No Spotify account, API keys or OAuth are needed.
+This section describes the default **Previews** sound, which needs no Spotify account, API keys or OAuth. For full songs, see [Full songs with Spotify](#full-songs-with-spotify).
 
 Spotify's Web API stopped returning `preview_url` for apps created after November 2024, and the Web Playback SDK needs Premium plus OAuth. This game uses Spotify's public **embed pages** instead:
 
@@ -146,7 +187,7 @@ The answer (title, artist, cover) is never written into the page before a guess 
 
 ## Limitations
 
-- **Track cap:** the embed page returns at most about **100 tracks** for a playlist. For example, a 150-song playlist yields its first 100. Larger playlists therefore only use their first ~100 songs.
+- **Track cap:** the embed page returns at most about **100 tracks** for a playlist (with full songs via Spotify, your own playlists aren't capped). For example, a 150-song playlist yields its first 100. Larger playlists therefore only use their first ~100 songs.
 - **Tracks without a preview are skipped.** The server reports how many were skipped and the game shows a notice. Tracks Spotify marks as unplayable are also skipped.
 - **CORS.** Browsers can't fetch `open.spotify.com` directly, so either the small Express server does the fetch (responses cached in memory for 10 minutes) or, in static mode, a public CORS proxy does.
 - **Unofficial data source.** The embed page format isn't a public API and could change without notice. The parser is defensive, and `test/fixtures/` holds real captured pages so you can tell quickly if the format breaks.
@@ -167,7 +208,7 @@ server/
   embed.js        server-side embed page fetch (uses public/lib/embed-parser.js)
 public/
   index.html, styles.css
-  config.js       API_BASE, the CORS proxy list for static mode, the example playlist
+  config.js       API_BASE, the CORS proxy list for static mode, the example playlist, SPOTIFY_CLIENT_ID
   data/
     example-playlist.json   bundled snapshot of the example playlist
   lib/
@@ -176,14 +217,18 @@ public/
     track-source.js   bundled example, backend detection, CORS-proxy fallback, cover lookup
     room.js           multiplayer rooms: protocol, host-side rules, player snapshots, host/player controllers
     transport.js      room networking: PeerTransport (PeerJS/WebRTC) and LocalTransport (BroadcastChannel)
+    spotify-auth.js   Spotify sign-in: PKCE, redirect handling, token storage and refresh
+    spotify-api.js    Spotify Web API: track lists (paged), player endpoints, retry/refresh and error mapping
+    spotify-player.js Spotify Connect: device list, Web Playback SDK device, play/pause/position
+    clip-engine.js    one clip-player interface for previews (<audio>) and full songs (Spotify), segment timing
   vendor/
     peerjs.min.js     PeerJS 1.5.5 (MIT, see LICENSE-peerjs.txt)
   game-logic.js   pure game rules (matching, options, turns, scoring), also used by tests
-  app.js          UI controller (pass-the-phone, room host, room player), clip player, persistence
+  app.js          UI controller (pass-the-phone, room host, room player), sound setting, persistence
 scripts/
   snapshot-playlist.js   `npm run snapshot`: saves a playlist to public/data/example-playlist.json
 test/
-  *.test.js       node:test suites (URL parsing, parser, track source, example snapshot, game logic, rooms, transport, HTTP API)
+  *.test.js       node:test suites (URL parsing, parser, track source, example snapshot, game logic, rooms, transport, HTTP API, Spotify sign-in, Web API, clip engines)
   fixtures/       captured embed pages (trimmed; session tokens removed)
 render.yaml       Render Blueprint for the optional backend
 .github/workflows/deploy.yml   GitHub Pages deployment

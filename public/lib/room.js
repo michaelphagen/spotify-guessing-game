@@ -105,7 +105,7 @@
   /**
    * @param {object} cfg
    * @param {string} cfg.code
-   * @param {object} cfg.settings   { mode, rounds, clipStart, sourceUrl }
+   * @param {object} cfg.settings   { mode, rounds, clipStart, sourceUrl, engine, device }
    * @param {object} cfg.source     { type, name, image, key }
    * @param {Array}  cfg.tracks
    * @param {string[]} [cfg.usedIds]
@@ -120,6 +120,13 @@
         rounds: cfg.settings && cfg.settings.rounds > 0 ? Math.floor(cfg.settings.rounds) : 0,
         clipStart: cfg.settings && cfg.settings.clipStart === 'random' ? 'random' : 'beginning',
         sourceUrl: (cfg.settings && cfg.settings.sourceUrl) || '',
+        // Host-only sound settings (never sent to phones): 'preview' (30-second
+        // previews) or 'spotify' (full songs via Spotify Connect), and the
+        // Spotify output device { id, name, local } chosen for it.
+        engine: cfg.settings && cfg.settings.engine === 'spotify' ? 'spotify' : 'preview',
+        device: cfg.settings && cfg.settings.device && cfg.settings.device.id
+          ? { id: String(cfg.settings.device.id), name: String(cfg.settings.device.name || ''), local: !!cfg.settings.device.local }
+          : null,
       },
       source: cfg.source || null,
       tracks: cfg.tracks || [],
@@ -445,6 +452,7 @@
         var t = G.trackById(g, cur.trackId);
         view.result = {
           outcome: cur.outcome,
+          match: cur.match || null, // 'exact' | 'close' | 'none' | null (free-answer matcher)
           points: cur.points,
           guess: cur.guess || '',
           extended: !!cur.extended,

@@ -63,4 +63,17 @@ window.GTS_CONFIG = {
    * Add ?transport=local to the URL to use tabs of one browser instead (testing).
    */
   PEERJS: null,
+
+  /*
+   * "Full songs via Spotify": the Client ID of the Spotify app used to sign in
+   * (https://developer.spotify.com/dashboard). Sign-in uses PKCE, so there is
+   * no client secret, here or anywhere else. The app's Redirect URIs must
+   * include this site's address, https://michaelphagen.github.io/spotify-guessing-game/
+   * and, for local development, http://127.0.0.1:3000/ (Spotify doesn't accept
+   * "localhost"). A host can still use a different app by pasting its Client
+   * ID on the setup screen ("Use a different Spotify app"; kept in that
+   * browser's localStorage). '' = no default: the host must paste one.
+   * See "Full songs with Spotify" in the README.
+   */
+  SPOTIFY_CLIENT_ID: 'a010d85057d64fdfabe0fb42155cacba',
 };

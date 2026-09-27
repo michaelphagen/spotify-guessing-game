@@ -23,6 +23,7 @@
   </header>
 
   <div id="conn-banner" class="conn-banner" role="status" hidden></div>
+  <div id="auth-banner" class="conn-banner bad" role="status" hidden><span id="auth-banner-text"></span> <button type="button" class="btn-link" id="auth-banner-signin">Sign in again</button></div>
   <div id="scoreboard" class="scoreboard" aria-label="Scoreboard" hidden></div>
 
   <main id="app">
@@ -64,7 +65,42 @@
             <label><input type="radio" name="clip-start" value="beginning" checked><span>From the beginning</span></label>
             <label><input type="radio" name="clip-start" value="random"><span>Random spot</span></label>
           </div>
-          <p class="hint">"Random spot" plays 5 (then 10 more) seconds from a random point in the preview instead of the very start.</p>
+          <p class="hint">"Random spot" plays 5 (then 10 more) seconds from a random point instead of the very start: anywhere in the song with full songs, or in the first half of the preview.</p>
+        </fieldset>
+
+        <fieldset class="field" id="sound-field">
+          <legend>Sound</legend>
+          <div class="segmented segmented-stack" role="radiogroup">
+            <label><input type="radio" name="engine" value="preview" checked><span>Previews<small>No sign-in. 30-second clips that usually start mid-song.</small></span></label>
+            <label><input type="radio" name="engine" value="spotify"><span>Full songs via Spotify<small>Sign in. “From the beginning” is the real start. Premium needed to play.</small></span></label>
+          </div>
+          <div class="sp-panel" id="sp-panel" hidden>
+            <div class="sp-signed-out" id="sp-signed-out">
+              <div class="field" id="sp-client-wrap">
+                <label for="sp-client-id">Spotify app Client ID</label>
+                <div class="link-row">
+                  <input id="sp-client-id" type="text" autocomplete="off" spellcheck="false" autocapitalize="off" placeholder="32 characters from your Spotify app">
+                  <button type="button" class="btn btn-ghost btn-small" id="sp-client-save">Save</button>
+                </div>
+                <p class="hint"><span id="sp-client-hint">One-time setup: create an app at <a href="https://developer.spotify.com/dashboard" target="_blank" rel="noopener noreferrer">developer.spotify.com/dashboard</a>, add <code id="sp-redirect"></code> as its Redirect URI, and paste its Client ID here. It stays in this browser.</span>
+                  <button type="button" class="btn-link" id="sp-client-default" hidden>Use this site’s app instead</button></p>
+              </div>
+              <button type="button" class="btn btn-spotify" id="sp-signin">Sign in with Spotify</button>
+              <p class="hint">Only the host signs in. Your sign-in stays in this browser.</p>
+              <button type="button" class="btn-link sp-other-app" id="sp-client-toggle" hidden>Use a different Spotify app</button>
+            </div>
+            <div class="sp-signed-in" id="sp-signed-in" hidden>
+              <p class="sp-account">Signed in as <strong id="sp-name">your Spotify account</strong> <button type="button" class="btn-link" id="sp-signout">Sign out</button></p>
+              <label for="sp-device">Play on</label>
+              <div class="link-row">
+                <select id="sp-device" aria-describedby="sp-device-hint"></select>
+                <button type="button" class="btn btn-ghost btn-small" id="sp-refresh">Refresh</button>
+              </div>
+              <p class="hint" id="sp-device-hint"></p>
+              <div><button type="button" class="btn btn-ghost btn-small" id="sp-test">Test sound</button></div>
+            </div>
+            <p class="hint sp-status" id="sp-status" role="status" hidden></p>
+          </div>
         </fieldset>
 
         <div class="field">
@@ -248,6 +284,12 @@
         </div>
       </div>
 
+      <div class="device-row" id="round-device" hidden>
+        <label for="round-device-select">Plays on</label>
+        <select id="round-device-select"></select>
+        <button type="button" class="btn-link" id="round-device-refresh">Refresh</button>
+      </div>
+
       <div class="row">
         <button type="button" class="btn btn-ghost" id="extend-btn" disabled>Play next 10 seconds <span class="pill">5 pts</span></button>
         <span class="worth" id="worth">Worth <strong>10</strong> points</span>
@@ -314,6 +356,10 @@
   <script src="lib/spotify-url.js"></script>
   <script src="lib/embed-parser.js"></script>
   <script src="lib/track-source.js"></script>
+  <script src="lib/spotify-auth.js"></script>
+  <script src="lib/spotify-api.js"></script>
+  <script src="lib/spotify-player.js"></script>
+  <script src="lib/clip-engine.js"></script>
   <script src="game-logic.js"></script>
   <script src="vendor/peerjs.min.js"></script>
   <script src="lib/transport.js"></script>

@@ -8,6 +8,11 @@
   'use strict';
 
   var G = window.GameLogic;
+  // Coming back from Spotify's sign-in page (?code=&state=): take those out of
+  // the address bar and put back the room parameters carried in `state`,
+  // before anything below reads location.search.
+  var spRedirect = null;
+  try { spRedirect = window.SpotifyAuth.consumeRedirect(window); } catch (e) { spRedirect = null; }
   var sessionStore = null;
   try { sessionStore = window.sessionStorage; } catch (e) { /* storage blocked */ }
   // Loads song lists from the Node backend, or (on static hosts such as GitHub
@@ -40,6 +45,36 @@
   var Transport = window.Transport;
   // ?transport=local: rooms between tabs of this browser (BroadcastChannel) instead of PeerJS.
   var TRANSPORT_KIND = Transport.kindFromSearch(window.location.search);
+
+  // Clip lengths: the first clip, and the extension unlocked by "play next ...
+  // seconds". Everything in this file reads them from here (in seconds via
+  // clipFirst() / clipTotal()), so a setting can change them in one place.
+  var CLIP = { firstMs: G.CLIP_SHORT * 1000, extendMs: (G.CLIP_LONG - G.CLIP_SHORT) * 1000 };
+  function clipFirst() { return CLIP.firstMs / 1000; }
+  function clipExtend() { return CLIP.extendMs / 1000; }
+  function clipTotal() { return (CLIP.firstMs + CLIP.extendMs) / 1000; }
+  function secs(n) { return String(Math.round(n * 10) / 10); }
+
+  // ---------- Spotify sign-in and full-song playback (host only) ----------
+
+  var localStore = null;
+  try { localStore = window.localStorage; } catch (e) { /* storage blocked */ }
+  var nullStore = { getItem: function () { return null; }, setItem: function () {}, removeItem: function () {} };
+  var LOCAL_SOUND = 'gts:sound'; // 'preview' | 'spotify'
+  var spAuth = window.SpotifyAuth.create({
+    fetch: window.fetch.bind(window),
+    storage: localStore || nullStore,
+    crypto: window.crypto,
+    location: window.location,
+    configClientId: (window.GTS_CONFIG || {}).SPOTIFY_CLIENT_ID || '',
+  });
+  var spApi = window.SpotifyApi.create({ auth: spAuth, fetch: window.fetch.bind(window) });
+  var spCtl = window.SpotifyPlayer.create({
+    api: spApi,
+    auth: spAuth,
+    storage: localStore,
+    loadSdk: function () { return window.SpotifyPlayer.loadSdk(window, document); },
+  });
 
   // ---------- Small helpers ----------
 
@@ -153,155 +188,19 @@
 
   // ---------- Clip player ----------
 
-  /**
-   * Plays a [start, end) segment of an audio URL and stops precisely at `end`.
-   * Stopping uses three mechanisms: a requestAnimationFrame poll (tight, ~16ms),
-   * the media `timeupdate` event, and a setTimeout safety net (background tabs).
-   */
-  function ClipPlayer(hooks) {
-    this.hooks = hooks;
-    this.audio = new Audio();
-    this.audio.preload = 'auto';
-    this.segEnd = 0;
-    this.playing = false;
-    this.raf = 0;
-    this.safety = 0;
-    this.token = 0;
-    var self = this;
-    this.audio.addEventListener('timeupdate', function () { self._check(); });
-    this.audio.addEventListener('playing', function () {
-      if (self.priming) return;
-      self.hooks.onState('playing');
-      self._armSafety();
-    });
-    this.audio.addEventListener('waiting', function () { if (self.playing) self.hooks.onState('loading'); });
-    this.audio.addEventListener('ended', function () { if (self.playing) self.stop(); });
-    this.audio.addEventListener('error', function () {
-      if (!self.audio.getAttribute('src')) return;
-      self.stop();
-      self.hooks.onError('This song’s preview could not be loaded.');
-    });
-  }
-  ClipPlayer.prototype.load = function (url) {
-    this.stop();
-    this.audio.src = url;
-    this.audio.load();
-  };
-  ClipPlayer.prototype.unload = function () {
-    this.stop();
-    this.audio.removeAttribute('src');
-    this.audio.load();
-  };
-  /**
-   * Room host: the audio is started by messages from phones, outside any tap
-   * on this device. Play the element once, muted, inside a real tap (e.g.
-   * "Start game") so browsers that need a gesture per element (iOS) allow it.
-   */
-  ClipPlayer.prototype.prime = function () {
-    var self = this;
-    var a = this.audio;
-    if (this.primed || this.playing || !a.getAttribute('src')) return;
-    this.primed = true;
-    this.priming = true;
-    a.muted = true;
-    var done = function () {
-      if (!self.priming) return;
-      self.priming = false;
-      if (!self.playing && !a.paused) a.pause();
-      try { if (!self.playing && a.readyState >= 1) a.currentTime = 0; } catch (e) { /* ignore */ }
-      a.muted = false;
-    };
-    var p;
-    try { p = a.play(); } catch (e) { p = null; }
-    if (p && p.then) p.then(done, done); else done();
-  };
-  /**
-   * Play [start, end) seconds. With `offsetFn`, start/end are relative to the
-   * clip's start offset, which is only final once the preview's duration is
-   * known (see clipOffset); if the metadata hasn't loaded yet, the segment is
-   * placed when it arrives, so every play of a song uses the same offset.
-   */
-  ClipPlayer.prototype.play = function (start, end, offsetFn) {
-    var self = this;
-    var a = this.audio;
-    if (this.priming) { this.priming = false; a.muted = false; }
-    this.stop();
-    var token = ++this.token;
-    var place = function () {
-      var off = offsetFn ? offsetFn() : 0;
-      self.segStart = start + off;
-      self.segEnd = end + off;
-    };
-    place();
-    this.playing = true;
-    this.hooks.onState('loading');
-    if (a.readyState >= 1) {
-      try { a.currentTime = this.segStart; } catch (e) { /* ignore */ }
-    } else if (this.segStart > 0 || offsetFn) {
-      a.addEventListener('loadedmetadata', function onMeta() {
-        a.removeEventListener('loadedmetadata', onMeta);
-        if (token !== self.token || !self.playing) return;
-        place();
-        try { a.currentTime = self.segStart; } catch (e) { /* ignore */ }
-        self._armSafety();
-      });
-    }
-    // play() is called synchronously inside the click handler (required on iOS).
-    var p = a.play();
-    if (p && p.catch) {
-      p.catch(function (err) {
-        if (token !== self.token) return;
-        self.stop();
-        if (err && err.name === 'AbortError') return;
-        self.hooks.onError(err && err.name === 'NotAllowedError'
-          ? 'Your browser blocked audio playback. Tap play again.'
-          : 'This song’s preview could not be played.');
-      });
-    }
-    var loop = function () {
-      if (token !== self.token || !self.playing) return;
-      self._check();
-      self.raf = requestAnimationFrame(loop);
-    };
-    this.raf = requestAnimationFrame(loop);
-  };
-  ClipPlayer.prototype._armSafety = function () {
-    var self = this;
-    clearTimeout(this.safety);
-    if (!this.playing) return;
-    var remaining = Math.max(0, this.segEnd - this.audio.currentTime);
-    var token = this.token;
-    // The media clock can lag wall time slightly, so when the timer fires we
-    // re-check the position and re-arm instead of cutting the clip short.
-    this.safety = setTimeout(function () {
-      if (token !== self.token || !self.playing) return;
-      if (self.audio.currentTime >= self.segEnd - 0.005 || self.audio.ended) self.stop();
-      else self._armSafety();
-    }, Math.max(20, remaining * 1000 + 20));
-  };
-  ClipPlayer.prototype._check = function () {
-    if (!this.playing) return;
-    var t = this.audio.currentTime;
-    if (t >= this.segEnd) {
-      this.stop();
-      return;
-    }
-    this.hooks.onProgress(t);
-  };
-  ClipPlayer.prototype.stop = function () {
-    var wasPlaying = this.playing;
-    this.playing = false;
-    this.token++;
-    cancelAnimationFrame(this.raf);
-    clearTimeout(this.safety);
-    var a = this.audio;
-    if (!a.paused) a.pause();
-    if (wasPlaying) {
-      this.hooks.onProgress(Math.min(this.segEnd, a.currentTime || 0));
-      try { if (a.readyState >= 1) a.currentTime = 0; } catch (e) { /* ignore */ }
-      this.hooks.onState('stopped');
-    }
-  };
+  // Two engines behind one interface (lib/clip-engine.js): 30-second previews
+  // in an <audio> element, or full songs through Spotify Connect. `player`
+  // forwards to whichever the current game uses (host only; phones never play).
+  var previewEngine = window.ClipEngine.createPreviewEngine({
+    createAudio: function () { return new Audio(); },
+    raf: function (f) { return requestAnimationFrame(f); },
+    caf: function (id) { cancelAnimationFrame(id); },
+  });
+  var spotifyEngine = window.ClipEngine.createSpotifyEngine({
+    controller: spCtl,
+    resolveTrack: function (t) { return spApi.getTrack(t.id).then(function (n) { return n || t; }); },
+  });
+  var player = window.ClipEngine.createSwitch(previewEngine);
 
   // ---------- App state ----------
 
@@ -309,36 +208,62 @@
   var turnUi = { heard: 0, playedOnce: false, audioError: false };
 
   /**
-   * Where the current song's clip actually starts, in seconds into the preview.
-   * Fitted to the preview's real duration once it is known (see
-   * GameLogic.clampClipStart); until then the stored offset is used as-is.
+   * Where the current song's clip starts, in ms into the audio, given the
+   * audio's duration (NaN while unknown).
+   * Previews: the stored offset (0-15 s), fitted to the preview's real length
+   * (GameLogic.clampClipStart). Full songs: "from the beginning" is 0 ms of the
+   * song; "random spot" is picked once per turn from the whole song
+   * (ClipEngine.randomFullStartMs) as soon as its duration is known, and kept
+   * in game.current.fullStart (seconds) so every play of the song uses it.
    */
-  function clipOffset() {
+  function clipOffsetMs(durationMs) {
     if (!game || !game.current) return 0;
-    return G.clampClipStart(game.current.clipStart, player.audio.duration);
+    var cur = game.current;
+    if (player.kind === 'spotify') {
+      if (game.clipStartMode !== 'random') return 0;
+      if (cur.fullStart == null && durationMs > 0) {
+        cur.fullStart = window.ClipEngine.randomFullStartMs(durationMs, CLIP.firstMs + CLIP.extendMs) / 1000;
+        saveGame();
+      }
+      return (cur.fullStart || 0) * 1000;
+    }
+    var d = durationMs / 1000;
+    var off = G.clampClipStart(cur.clipStart, d);
+    // A full-song start (from an earlier Spotify turn) doesn't fit a preview.
+    if (!(isFinite(d) && d > 0)) off = Math.min(off, G.MAX_CLIP_START);
+    return off * 1000;
   }
+  /** The current clip's offset in seconds (for clip-relative progress). */
+  function clipOffset() { return clipOffsetMs(player.durationMs()) / 1000; }
 
-  var player = new ClipPlayer({
-    onProgress: function (t) {
-      // Result-screen preview: a phone's Next can stop it after the next turn began.
-      if (!game || game.phase !== 'round' || resultMode === 'listen') return;
-      renderProgress(t - clipOffset());
-      if (player.playing) reportPlayback('playing');
-    },
-    onState: function (s) {
-      var listening = resultMode === 'listen'; // onPlayerState clears it on 'stopped'
-      onPlayerState(s);
-      if (!listening) reportPlayback(s);
-    },
-    onError: function (msg) {
-      if (!game || game.phase !== 'round') { toast(msg); return; }
-      turnUi.audioError = true;
-      var blocked = /blocked/.test(msg);
-      showNotice(blocked && hosting ? 'This browser blocked the sound. Tap play on this screen once to allow it.'
-        : msg + ' You can skip it (no points) or reveal the answer.');
-      $('skip-btn').hidden = false;
-      reportPlayback(blocked ? 'blocked' : 'error', blocked ? 'The host’s browser blocked the sound. Ask the host to tap play on their screen.' : msg);
-    },
+  player.onProgress(function (ms) {
+    // Result-screen playback: a phone's Next can stop it after the next turn began.
+    if (!game || game.phase !== 'round' || resultMode === 'listen') return;
+    renderProgress(ms / 1000 - clipOffset());
+    if (player.playing) reportPlayback('playing');
+  });
+  player.onState(function (s) {
+    var listening = resultMode === 'listen'; // onPlayerState clears it on 'stopped'
+    onPlayerState(s);
+    if (!listening) reportPlayback(s);
+  });
+  player.onError(function (msg, err) {
+    var code = err && err.code;
+    if (code === 'premium') { fallbackToPreviews(msg); return; }
+    if (code === 'signed-out') {
+      // The banner (with "Sign in again") says it; the phones hear why nothing plays.
+      showAuthBanner();
+      reportPlayback('error', 'The host’s Spotify sign-in has expired. Ask the host to sign in again.');
+      return;
+    }
+    if (!game || game.phase !== 'round') { toast(msg, 6000); return; }
+    turnUi.audioError = true;
+    var blocked = code === 'blocked';
+    showNotice(blocked && hosting ? 'This browser blocked the sound. Tap play on this screen once to allow it.'
+      : code === 'no-device' || code === 'rate' ? msg
+      : msg + ' You can skip it (no points) or reveal the answer.');
+    $('skip-btn').hidden = false;
+    reportPlayback(blocked ? 'blocked' : 'error', blocked ? 'The host’s browser blocked the sound. Ask the host to tap play on their screen.' : msg);
   });
   var resultMode = null; // 'listen' when the result-screen preview is playing
 
@@ -346,6 +271,285 @@
     if (hosting) { store.set(STORE_ROOM, hosting.room); persistHostRoom(); return; }
     if (game) store.set(STORE_GAME, game);
     else store.remove(STORE_GAME);
+  }
+
+  // ---------- Sound: previews or full songs via Spotify ----------
+
+  var LOCAL_SP_NAME = 'gts:sp:name';
+  var spDevices = [];
+  var spDevicesLoading = false;
+
+  function soundPref() { return local.get(LOCAL_SOUND) === 'spotify' ? 'spotify' : 'preview'; }
+  function setSoundPref(v) { local.set(LOCAL_SOUND, v === 'spotify' ? 'spotify' : 'preview'); }
+
+  /** The engine of the game on this device: the hosted room's, or the pass-the-phone game's. */
+  function currentEngineName() {
+    if (hosting) return hosting.room.settings.engine === 'spotify' ? 'spotify' : 'preview';
+    return game && game.engine === 'spotify' ? 'spotify' : 'preview';
+  }
+
+  /** Point `player` at the current game's engine; start Spotify's side when needed. */
+  function syncEngine() {
+    var name = currentEngineName();
+    player.use(name === 'spotify' ? spotifyEngine : previewEngine);
+    $('round-device').hidden = name !== 'spotify' || !!joined;
+    if (name === 'spotify') ensureSpotifyReady();
+  }
+
+  function listenLabel() { return player.kind === 'spotify' ? 'Play the song' : 'Listen to the preview'; }
+
+  var spReadyStarted = false;
+  /** Signed in: register this browser as a device (Web Playback SDK) and list devices. */
+  function ensureSpotifyReady() {
+    if (!spAuth.isSignedIn()) {
+      if (currentEngineName() === 'spotify' && game) showAuthBanner();
+      return;
+    }
+    if (spReadyStarted) return;
+    spReadyStarted = true;
+    if (!local.get(LOCAL_SP_NAME)) {
+      spApi.me().then(function (me) {
+        if (me && (me.display_name || me.id)) { local.set(LOCAL_SP_NAME, me.display_name || me.id); renderSound(); }
+      }, function () { /* the name is cosmetic */ });
+    }
+    spCtl.connectSdk().then(function () { refreshDevices(); });
+    refreshDevices();
+  }
+
+  function soundStatus(msg, kind) {
+    var p = $('sp-status');
+    p.textContent = msg || '';
+    p.hidden = !msg;
+    p.className = 'hint sp-status' + (kind ? ' ' + kind : '');
+  }
+
+  function renderSound() {
+    var pref = soundPref();
+    var r = document.querySelector('input[name="engine"][value="' + pref + '"]');
+    if (r) r.checked = true;
+    $('sp-panel').hidden = pref !== 'spotify';
+    var signed = spAuth.isSignedIn();
+    $('sp-signed-out').hidden = signed;
+    $('sp-signed-in').hidden = !signed;
+    // With a default app in config.js the Client ID field is tucked away behind
+    // "Use a different Spotify app"; a pasted Client ID overrides the default.
+    var hasDefault = spAuth.hasConfigClientId();
+    var override = spAuth.hasClientIdOverride();
+    var showField = !hasDefault || override || clientFieldOpen;
+    $('sp-client-wrap').hidden = !showField;
+    $('sp-client-toggle').hidden = showField;
+    $('sp-client-default').hidden = !(hasDefault && override);
+    if (document.activeElement !== $('sp-client-id')) $('sp-client-id').value = override ? spAuth.clientId() : '';
+    $('sp-redirect').textContent = spAuth.redirectUri();
+    $('sp-name').textContent = local.get(LOCAL_SP_NAME) || 'your Spotify account';
+    renderDevices();
+  }
+
+  function refreshDevices() {
+    if (!spAuth.isSignedIn()) return Promise.resolve([]);
+    spDevicesLoading = true;
+    renderDevices();
+    return spCtl.listDevices().then(function (list) {
+      spDevicesLoading = false;
+      spDevices = list;
+      var sel = spCtl.selectedDevice();
+      if (!sel && list.length) {
+        // Nothing chosen yet: this browser, else the device already playing, else the first.
+        var pick = list.filter(function (d) { return d.local; })[0] || list.filter(function (d) { return d.isActive; })[0] || list[0];
+        spCtl.selectDevice(pick);
+        rememberRoomDevice();
+      }
+      renderDevices();
+      return list;
+    }, function (err) {
+      spDevicesLoading = false;
+      renderDevices();
+      if (err && err.code === 'signed-out') { renderSound(); if (game && currentEngineName() === 'spotify') showAuthBanner(); }
+      soundStatus(err && err.message ? err.message : 'Couldn’t list your Spotify devices.', 'bad');
+      return [];
+    });
+  }
+
+  function renderDevices() {
+    var selId = spCtl.deviceId();
+    var sel = spCtl.selectedDevice();
+    ['sp-device', 'round-device-select'].forEach(function (id) {
+      var box = $(id);
+      box.textContent = '';
+      var list = spDevices.slice();
+      if (sel && selId && !list.some(function (d) { return d.id === selId; })) {
+        list.push({ id: selId, label: (sel.local ? window.SpotifyPlayer.PLAYER_NAME + ' (this browser)' : sel.name) + ' (not available right now)' });
+      }
+      if (!list.length) box.appendChild(el('option', { value: '', text: spDevicesLoading ? 'Looking for devices…' : 'No devices found' }));
+      list.forEach(function (d) { box.appendChild(el('option', { value: d.id, text: d.label })); });
+      if (!selId && list.length) box.insertBefore(el('option', { value: '', text: 'Pick a device…' }), box.firstChild);
+      box.value = selId && list.some(function (d) { return d.id === selId; }) ? selId : '';
+    });
+    var info = spCtl.sdkInfo();
+    var hint = info.status === 'loading' ? 'Starting the player in this browser…'
+      : info.status === 'failed' ? info.error + ' Open Spotify on your phone or computer, then Refresh and pick it.'
+      : !spDevices.length && !spDevicesLoading ? 'Open Spotify on your phone, computer or speaker, then tap Refresh.'
+      : 'The songs play on this device. Only the host needs Spotify.';
+    $('sp-device-hint').textContent = hint;
+  }
+
+  function onDevicePicked(e) {
+    var id = e.target.value;
+    var d = spDevices.filter(function (x) { return x.id === id; })[0];
+    if (!d) return;
+    if (player.playing && player.kind === 'spotify') player.stop();
+    spCtl.selectDevice(d);
+    rememberRoomDevice();
+    renderDevices();
+    soundStatus('');
+  }
+
+  /** The hosted room keeps its device choice, so a resumed room plays on the same device. */
+  function rememberRoomDevice() {
+    if (!hosting) return;
+    hosting.room.settings.device = spCtl.selectedDevice();
+    saveGame();
+  }
+
+  var clientFieldOpen = false;
+  function onClientIdSave() {
+    var v = $('sp-client-id').value.trim();
+    if (!spAuth.setClientId(v)) { soundStatus('That doesn’t look like a Client ID (32 letters and digits from your Spotify app’s settings).', 'bad'); return false; }
+    soundStatus(v ? 'Client ID saved in this browser.' : '', v ? 'ok' : '');
+    return true;
+  }
+
+  /** Send the browser to Spotify's sign-in page; it comes back to this page (and game). */
+  function signIn() {
+    if (window.location.hostname === 'localhost') {
+      var alt = window.location.href.replace('//localhost', '//127.0.0.1');
+      soundStatus('Spotify doesn’t accept “localhost” addresses. Open ' + alt + ' instead (and register http://127.0.0.1:<port>/ as a Redirect URI).', 'bad');
+      toast('Open the game at 127.0.0.1 instead of localhost to sign in.', 6000);
+      return;
+    }
+    var typed = $('sp-client-id').value.trim();
+    if (!$('sp-client-wrap').hidden && typed && typed !== spAuth.clientId() && !onClientIdSave()) return;
+    spAuth.beginSignIn(window.location.search).then(function (url) {
+      window.location.assign(url);
+    }, function (err) {
+      soundStatus(err && err.message ? err.message : 'Couldn’t start signing in.', 'bad');
+      toast(err && err.message ? err.message : 'Couldn’t start signing in.', 6000);
+    });
+  }
+
+  function signOut() {
+    if (player.playing && player.kind === 'spotify') player.stop();
+    spCtl.disconnect();
+    spAuth.signOut();
+    local.remove(LOCAL_SP_NAME);
+    spDevices = [];
+    spReadyStarted = false;
+    soundStatus('Signed out of Spotify.');
+    renderSound();
+  }
+
+  /** Spotify redirected back here with ?code=: finish signing in. */
+  function finishSignIn(r) {
+    spAuth.completeSignIn(r).then(function () {
+      setSoundPref('spotify');
+      hideAuthBanner();
+      toast('Signed in to Spotify.');
+      if (currentScreen === 'setup') renderSound();
+      ensureSpotifyReady();
+    }, function (err) {
+      toast(err && err.message ? err.message : 'Spotify sign-in failed.', 6000);
+      if (currentScreen === 'setup') { renderSound(); soundStatus(err && err.message ? err.message : 'Spotify sign-in failed.', 'bad'); }
+    });
+  }
+
+  function showAuthBanner(msg) {
+    $('auth-banner-text').textContent = msg || 'Your Spotify sign-in has expired, so full songs can’t play. The game is saved.';
+    $('auth-banner').hidden = false;
+  }
+  function hideAuthBanner() { $('auth-banner').hidden = true; }
+
+  var testEngine = null;
+  /** "Test sound": a second and a half of music on the chosen device. */
+  function onTestSound() {
+    spCtl.activate(); // inside the tap: lets this browser's player make sound
+    if (!spCtl.deviceId()) { soundStatus('Pick a device first. If yours isn’t listed, open Spotify on it and tap Refresh.', 'bad'); return; }
+    if (!testEngine) {
+      testEngine = window.ClipEngine.createSpotifyEngine({ controller: spCtl });
+      testEngine.onEnded(function () {
+        $('sp-test').disabled = false;
+        var d = spCtl.selectedDevice();
+        soundStatus('Sound works on ' + (d && d.local ? 'this browser' : d ? d.name : 'that device') + '.', 'ok');
+      });
+      testEngine.onError(function (msg, err) {
+        $('sp-test').disabled = false;
+        if (err && err.code === 'premium') {
+          soundStatus('Full-song playback needs Spotify Premium. Use Previews instead.', 'bad');
+          return;
+        }
+        soundStatus(msg, 'bad');
+      });
+    }
+    $('sp-test').disabled = true;
+    soundStatus('Playing a moment of music…');
+    tracksSource.loadExampleSnapshot().then(function (data) {
+      var t = data && data.tracks && data.tracks[0];
+      var id = t ? t.id : '4uLU6hMCjMI75M1A2tKUQC';
+      testEngine.load({ id: id, uri: 'spotify:track:' + id });
+      testEngine.playSegment(30000, 31500);
+    });
+  }
+
+  /**
+   * Spotify said Premium is required (or the host chose to): continue this
+   * game with 30-second previews. Songs loaded from the Web API have no
+   * preview URL, so the previews are looked up from the public embed page
+   * and songs without one are taken out of the queue.
+   */
+  var fallingBack = false;
+  function fallbackToPreviews(msg) {
+    setSoundPref('preview');
+    if (hosting) hosting.room.settings.engine = 'preview';
+    else if (game) game.engine = 'preview';
+    player.use(previewEngine);
+    $('round-device').hidden = true;
+    saveGame();
+    if (!game || fallingBack) { toast(msg, 8000); return; }
+    var g = game;
+    var inRound = function () { return game === g && g.phase === 'round' && g.current && !g.current.answered && currentScreen === 'round'; };
+    if (inRound()) showNotice(msg + ' Loading the previews…');
+    else toast(msg, 8000);
+    var missing = g.tracks.some(function (t) { return !t.previewUrl; });
+    fallingBack = true;
+    var lookup = missing && g.sourceUrl ? tracksSource.loadTracks(g.sourceUrl) : Promise.resolve(null);
+    lookup.catch(function () { return null; }).then(function (data) {
+      fallingBack = false;
+      if (game !== g) return;
+      var byId = {};
+      if (data && data.tracks) data.tracks.forEach(function (t) { if (t.previewUrl) byId[t.id] = t.previewUrl; });
+      var lists = [g.tracks].concat(hosting && hosting.room.tracks !== g.tracks ? [hosting.room.tracks] : []);
+      lists.forEach(function (list) { list.forEach(function (t) { if (!t.previewUrl && byId[t.id]) t.previewUrl = byId[t.id]; }); });
+      var playable = {};
+      g.tracks.forEach(function (t) { if (t.previewUrl) playable[t.id] = true; });
+      var before = g.queue.length;
+      g.queue = g.queue.filter(function (id) { return playable[id]; });
+      saveGame();
+      if (hosting) hosting.ctl.broadcast();
+      var dropped = before - g.queue.length;
+      var extra = dropped ? ' ' + dropped + ' song' + (dropped === 1 ? '' : 's') + ' without a preview were taken out.' : '';
+      if (inRound()) {
+        var tr = currentTrack();
+        player.load(tr);
+        turnUi.audioError = false;
+        if (!tr.previewUrl) {
+          showNotice(msg + extra + ' This song has no preview: skip it (no points) or reveal the answer.');
+          $('skip-btn').hidden = false;
+        } else showNotice(msg + extra);
+      } else if (currentScreen === 'result') {
+        player.load(currentTrack());
+        $('listen-btn').textContent = listenLabel();
+        $('listen-btn').hidden = !currentTrack().previewUrl;
+      }
+    });
   }
 
   // ---------- Setup screen ----------
@@ -420,6 +624,7 @@
       mode: modeInput ? modeInput.value : 'choice',
       rounds: parseInt($('rounds-select').value, 10) || 0,
       clipStart: clipStartInput ? clipStartInput.value : 'beginning',
+      engine: soundPref(),
     };
   }
 
@@ -484,7 +689,10 @@
     applySetup(store.get(STORE_SETUP) || {});
     refreshExcludeHint();
     setupError('');
+    hideAuthBanner();
     showScreen('setup');
+    renderSound();
+    if (soundPref() === 'spotify') ensureSpotifyReady();
     try { renderResumeOffers(); } catch (e) { $('resume-box').hidden = true; if (window.console) console.error(e); }
   }
 
@@ -495,8 +703,19 @@
   async function loadSongs(setup, excludeUsed) {
     setupError('');
     if (!setup.url) { setupError('Paste a Spotify playlist, album or track link to start.'); $('url-input').focus(); return null; }
+    var spotify = setup.engine === 'spotify';
+    if (spotify && !spAuth.isSignedIn()) {
+      goToSetup();
+      setupError('Sign in with Spotify under Sound to play full songs, or choose Previews.');
+      return null;
+    }
+    if (spotify && !spCtl.deviceId()) {
+      goToSetup();
+      setupError('Pick where the songs should play under Sound (“Play on”). If your device isn’t listed, open Spotify on it and tap Refresh.');
+      return null;
+    }
     store.set(STORE_SETUP, setup);
-    $('loading-text').textContent = tracksSource.isExample(setup.url)
+    $('loading-text').textContent = spotify ? 'Loading songs from Spotify…' : tracksSource.isExample(setup.url)
       ? 'Loading the example playlist…'
       : tracksSource.mode() === 'static'
       ? 'Loading songs from Spotify through a public proxy…'
@@ -505,8 +724,9 @@
 
     var data;
     try {
-      data = await tracksSource.loadTracks(setup.url);
+      data = spotify ? await loadSpotifyTracks(setup.url) : await tracksSource.loadTracks(setup.url);
     } catch (err) {
+      if (err && err.code === 'signed-out') { goToSetup(); renderSound(); setupError(err.message); return null; }
       if (err && err.attempts && window.console) console.warn('Static mode: every CORS proxy failed.', err.attempts);
       // goToSetup() refills the form: "Play again" (or a restored game) may not have filled it.
       goToSetup();
@@ -533,15 +753,40 @@
     } else if (mode === 'choice' && distinct < 4) {
       notes.push('This link has only ' + distinct + ' different songs, so each question has ' + distinct + ' options.');
     }
-    if (data.skipped) notes.push(data.skipped + ' song' + (data.skipped === 1 ? '' : 's') + ' without a preview were skipped.');
+    if (data.note) notes.push(data.note);
+    if (data.skipped) {
+      notes.push(data.skipped + ' song' + (data.skipped === 1 ? '' : 's') +
+        (data.via === 'spotify' ? ' that can’t be played (local files or unavailable here) were skipped.' : ' without a preview were skipped.'));
+    }
     if (used.length) notes.push('Skipping ' + (data.tracks.length - fresh.length) + ' song(s) you already heard.');
     return {
       mode: mode,
+      engine: spotify ? 'spotify' : 'preview',
       tracks: data.tracks,
       used: used,
       notes: notes,
       source: { type: data.source.type, name: data.source.name, image: data.source.image, key: key },
     };
+  }
+
+  /**
+   * Full songs: every song of the link from the Web API (no 100-song cap).
+   * Spotify only shows the songs of playlists the signed-in user owns or
+   * collaborates on; for other playlists the public embed page (or the
+   * bundled example) is used as before, up to about 100 songs.
+   */
+  async function loadSpotifyTracks(url) {
+    var ref = window.SpotifyUrl.parseSpotifyInput(url);
+    try {
+      return await spApi.loadTracks(ref);
+    } catch (err) {
+      if (!err || err.code !== 'playlist-not-owned') throw err;
+      var data = await tracksSource.loadTracks(url);
+      return Object.assign({}, data, {
+        tracks: data.tracks.map(function (t) { return Object.assign({ uri: 'spotify:track:' + t.id }, t); }),
+        note: err.message + ' Using the songs on its public page instead' + (data.tracks.length >= 95 ? ' (the first ~100).' : '.'),
+      });
+    }
   }
 
   async function startFromSetup(setup, excludeUsed) {
@@ -558,6 +803,7 @@
       sourceUrl: setup.url,
     });
     game.notes = songs.notes;
+    game.engine = songs.engine;
     var key = songs.source.key;
     G.startTurn(game);
     setUsed(key, game.usedIds);
@@ -611,7 +857,7 @@
     var track = currentTrack();
     var roomTurn = hosting ? hosting.room.turn : null;
     turnUi = {
-      heard: cur.extended ? G.CLIP_SHORT : roomTurn ? roomTurn.heard : 0,
+      heard: cur.extended ? clipFirst() : roomTurn ? roomTurn.heard : 0,
       playedOnce: cur.extended || !!(roomTurn && roomTurn.playedOnce),
       audioError: false,
     };
@@ -652,7 +898,8 @@
     renderExtendState();
     renderProgress(turnUi.heard);
     onPlayerState('stopped');
-    player.load(track.previewUrl);
+    syncEngine();
+    player.load(track);
   }
 
   function renderExtendState() {
@@ -664,25 +911,25 @@
     $('worth').appendChild(document.createTextNode('Worth '));
     $('worth').appendChild(el('strong', { text: String(cur.extended ? G.POINTS.extended : G.POINTS.short) }));
     $('worth').appendChild(document.createTextNode(' points'));
-    $('play-btn').setAttribute('aria-label', cur.extended ? 'Play the first 15 seconds' : 'Play the first 5 seconds');
+    $('play-btn').setAttribute('aria-label', 'Play the first ' + secs(cur.extended ? clipTotal() : clipFirst()) + ' seconds');
   }
 
   function renderProgress(t) {
     if (!game || !game.current) return;
     var cur = game.current;
-    turnUi.heard = Math.max(turnUi.heard, Math.min(t, cur.extended ? G.CLIP_LONG : G.CLIP_SHORT));
+    turnUi.heard = Math.max(turnUi.heard, Math.min(t, cur.extended ? clipTotal() : clipFirst()));
     var shown = player.playing ? t : turnUi.heard;
-    var short = Math.min(shown, G.CLIP_SHORT) / G.CLIP_SHORT;
-    var long = Math.max(0, Math.min(shown, G.CLIP_LONG) - G.CLIP_SHORT) / (G.CLIP_LONG - G.CLIP_SHORT);
+    var short = Math.min(shown, clipFirst()) / clipFirst();
+    var long = Math.max(0, Math.min(shown, clipTotal()) - clipFirst()) / clipExtend();
     $('fill-short').style.width = (short * 100).toFixed(2) + '%';
     $('fill-long').style.width = (long * 100).toFixed(2) + '%';
-    $('clip-time').textContent = Math.min(shown, G.CLIP_LONG).toFixed(1) + 's';
+    $('clip-time').textContent = Math.min(shown, clipTotal()).toFixed(1) + 's';
   }
 
   function onPlayerState(s) {
     var btn = $('play-btn');
     if (resultMode === 'listen') {
-      $('listen-btn').textContent = s === 'stopped' ? 'Listen to the preview' : 'Stop';
+      $('listen-btn').textContent = s === 'stopped' ? listenLabel() : player.kind === 'spotify' ? 'Pause' : 'Stop';
       if (s === 'stopped') resultMode = null;
       return;
     }
@@ -691,14 +938,14 @@
     btn.classList.toggle('loading', s === 'loading');
     var cur = game.current;
     var status = $('clip-status');
-    var playingExtension = cur.extended && Math.round(player.segStart - clipOffset()) > 0;
+    var playingExtension = cur.extended && Math.round(player.segStartMs / 1000 - clipOffset()) > 0;
     if (s === 'loading') status.textContent = 'Loading…';
-    else if (s === 'playing') status.textContent = playingExtension ? 'Playing seconds 5–15' : 'Playing…';
+    else if (s === 'playing') status.textContent = playingExtension ? 'Playing seconds ' + secs(clipFirst()) + '–' + secs(clipTotal()) : 'Playing…';
     else {
       if (turnUi.heard > 0) turnUi.playedOnce = true;
       status.textContent = !turnUi.playedOnce
-        ? 'Tap play to hear 5 seconds'
-        : cur.extended ? 'Tap play to hear all 15 seconds again' : 'Tap play to hear it again';
+        ? 'Tap play to hear ' + secs(clipFirst()) + ' seconds'
+        : cur.extended ? 'Tap play to hear all ' + secs(clipTotal()) + ' seconds again' : 'Tap play to hear it again';
       renderExtendState();
       renderProgress(turnUi.heard);
     }
@@ -709,7 +956,7 @@
     if (!turnUi.audioError) return;
     turnUi.audioError = false;
     showNotice('');
-    player.load(currentTrack().previewUrl);
+    player.load(currentTrack());
   }
 
   function onPlayClick() {
@@ -724,7 +971,7 @@
     var cur = game.current;
     reloadAfterError();
     turnUi.heard = 0;
-    player.play(0, cur.extended ? G.CLIP_LONG : G.CLIP_SHORT, clipOffset);
+    player.playSegment(0, cur.extended ? CLIP.firstMs + CLIP.extendMs : CLIP.firstMs, clipOffsetMs);
   }
 
   function onExtendClick() {
@@ -735,8 +982,8 @@
     saveGame();
     renderExtendState();
     reloadAfterError();
-    turnUi.heard = G.CLIP_SHORT;
-    player.play(G.CLIP_SHORT, G.CLIP_LONG, clipOffset);
+    turnUi.heard = clipFirst();
+    player.playSegment(CLIP.firstMs, CLIP.firstMs + CLIP.extendMs, clipOffsetMs);
   }
 
   function submit(kind, value) {
@@ -772,10 +1019,10 @@
     var v = $('verdict');
     v.className = 'verdict ' + cur.outcome;
     var name = game.players[G.currentPlayerIndex(game)].name;
-    var title = { correct: 'Correct! +' + cur.points, wrong: 'Not quite', revealed: 'Answer revealed', skipped: 'Song skipped' }[cur.outcome];
+    var title = { correct: (cur.match === 'close' ? 'Close enough! +' : 'Correct! +') + cur.points, wrong: 'Not quite', revealed: 'Answer revealed', skipped: 'Song skipped' }[cur.outcome];
     $('verdict-title').textContent = title;
     var sub = '';
-    if (cur.outcome === 'correct') sub = name + (cur.extended ? ' got it with the extra 10 seconds.' : ' got it in 5 seconds!');
+    if (cur.outcome === 'correct') sub = name + (cur.extended ? ' got it with the extra ' + secs(clipExtend()) + ' seconds.' : ' got it in ' + secs(clipFirst()) + ' seconds!');
     else if (cur.outcome === 'wrong') sub = cur.guess ? name + ' guessed “' + cur.guess + '”. No points.' : 'No points this time.';
     else sub = 'No points this time.';
     $('verdict-sub').textContent = sub;
@@ -785,7 +1032,9 @@
     $('spotify-link').href = 'https://open.spotify.com/track/' + encodeURIComponent(track.id);
     setCover(track);
 
-    $('listen-btn').hidden = false;
+    syncEngine();
+    $('listen-btn').textContent = listenLabel();
+    $('listen-btn').hidden = player.kind === 'preview' && !track.previewUrl;
     $('next-btn').hidden = false;
     $('next-btn').disabled = false;
     $('result-wait').hidden = true;
@@ -824,9 +1073,10 @@
   function onListenClick() {
     if (resultMode === 'listen' && player.playing) { player.stop(); return; }
     resultMode = 'listen';
-    $('listen-btn').textContent = 'Stop';
-    var d = player.audio.duration;
-    player.play(0, isFinite(d) && d > 0 ? d : 30);
+    $('listen-btn').textContent = player.kind === 'spotify' ? 'Pause' : 'Stop';
+    var d = player.durationMs();
+    // The whole preview, or the whole song (its length comes from Spotify if unknown).
+    player.playSegment(0, d > 0 ? d : player.kind === 'spotify' ? 3600000 : 30000);
   }
 
   function onNextClick() {
@@ -914,7 +1164,10 @@
     if (!songs) return;
     var room = Room.createRoom({
       code: Room.generateCode(),
-      settings: { mode: songs.mode, rounds: setup.rounds, clipStart: setup.clipStart, sourceUrl: setup.url },
+      settings: {
+        mode: songs.mode, rounds: setup.rounds, clipStart: setup.clipStart, sourceUrl: setup.url,
+        engine: songs.engine, device: songs.engine === 'spotify' ? spCtl.selectedDevice() : null,
+      },
       source: songs.source,
       tracks: songs.tracks,
       usedIds: songs.used,
@@ -953,6 +1206,8 @@
   /** Reopen a saved room (same code): phones with their token get their slots back. */
   function resumeRoom(room) {
     store.remove(STORE_GAME);
+    // Full songs: play on the device this room used (this browser's player gets a new id each visit).
+    if (room.settings && room.settings.device && room.settings.engine === 'spotify') spCtl.selectDevice(room.settings.device);
     openRoom(room, false);
   }
 
@@ -1250,8 +1505,8 @@
     if (effect.type === 'play') {
       reloadAfterError();
       if (effect.extend) renderExtendState();
-      turnUi.heard = effect.extend ? G.CLIP_SHORT : 0;
-      player.play(effect.from, effect.to, clipOffset);
+      turnUi.heard = effect.extend ? clipFirst() : 0;
+      player.playSegment(effect.from * 1000, effect.to * 1000, clipOffsetMs);
     } else if (effect.type === 'stop' || effect.type === 'answered' || effect.type === 'over' || effect.type === 'next') {
       player.stop();
     }
@@ -1322,9 +1577,9 @@
     var playing = status === 'playing' || status === 'loading';
     hosting.ctl.playback({
       status: status,
-      pos: playing ? Math.max(0, (player.audio.currentTime || 0) - off) : turnUi.heard,
-      from: playing ? player.segStart - off : 0,
-      to: playing ? player.segEnd - off : 0,
+      pos: playing ? Math.max(0, player.positionMs() / 1000 - off) : turnUi.heard,
+      from: playing ? player.segStartMs / 1000 - off : 0,
+      to: playing ? player.segEndMs / 1000 - off : 0,
       message: msg || '',
     });
   }
@@ -1700,7 +1955,7 @@
     $('pt-worth').appendChild(document.createTextNode(' points'));
     $('pt-play').disabled = j.pending;
     $('pt-play').setAttribute('aria-label', busy ? 'Stop the song on the host’s device'
-      : t.extended ? 'Play the first 15 seconds on the host’s device' : 'Play the first 5 seconds on the host’s device');
+      : 'Play the first ' + secs(t.extended ? clipTotal() : clipFirst()) + ' seconds on the host’s device');
     $('pt-reveal').disabled = j.pending;
     $('pt-choice').querySelectorAll('.option').forEach(function (b) { b.disabled = j.pending; });
     $('pt-free').querySelectorAll('input, button').forEach(function (x) { x.disabled = j.pending; });
@@ -1718,24 +1973,24 @@
     var t = j.view.turn;
     var pb = j.playback || { status: 'idle', pos: 0, heard: 0 };
     var busy = pb.status === 'playing' || pb.status === 'loading';
-    var cap = t.extended ? G.CLIP_LONG : G.CLIP_SHORT;
+    var cap = t.extended ? clipTotal() : clipFirst();
     var pre = mine ? 'pt-' : 'pw-';
     var shown = busy ? pb.pos : pb.heard || 0;
     if (pb.status === 'playing' && j.playbackAt) {
       shown = Math.min(pb.to || cap, pb.pos + (now() - j.playbackAt) / 1000);
     }
-    var short = Math.min(shown, G.CLIP_SHORT) / G.CLIP_SHORT;
-    var long = Math.max(0, Math.min(shown, G.CLIP_LONG) - G.CLIP_SHORT) / (G.CLIP_LONG - G.CLIP_SHORT);
+    var short = Math.min(shown, clipFirst()) / clipFirst();
+    var long = Math.max(0, Math.min(shown, clipTotal()) - clipFirst()) / clipExtend();
     $(pre + 'fill-short').style.width = (short * 100).toFixed(2) + '%';
     $(pre + 'fill-long').style.width = (long * 100).toFixed(2) + '%';
     $(pre + 'seg-long').classList.toggle('locked', !t.extended);
-    $(pre + 'time').textContent = Math.min(shown, G.CLIP_LONG).toFixed(1) + 's';
-    var extPart = pb.from >= G.CLIP_SHORT - 0.01;
+    $(pre + 'time').textContent = Math.min(shown, clipTotal()).toFixed(1) + 's';
+    var extPart = pb.from >= clipFirst() - 0.01;
     var status = pb.status === 'loading' ? 'Loading on the host…'
-      : pb.status === 'playing' ? (extPart ? 'Playing seconds 5–15' : 'Playing on the host…')
+      : pb.status === 'playing' ? (extPart ? 'Playing seconds ' + secs(clipFirst()) + '–' + secs(clipTotal()) : 'Playing on the host…')
       : pb.status === 'blocked' || pb.status === 'error' ? (pb.message || 'The song couldn’t be played.')
-      : !t.playedOnce ? (mine ? 'Tap play to hear 5 seconds' : 'Waiting for the song…')
-      : mine ? (t.extended ? 'Tap play to hear all 15 seconds again' : 'Clip finished. Tap play to hear it again')
+      : !t.playedOnce ? (mine ? 'Tap play to hear ' + secs(clipFirst()) + ' seconds' : 'Waiting for the song…')
+      : mine ? (t.extended ? 'Tap play to hear all ' + secs(clipTotal()) + ' seconds again' : 'Clip finished. Tap play to hear it again')
       : 'Clip finished';
     $(pre + 'status').textContent = status;
     if (mine) {
@@ -1784,13 +2039,13 @@
     var who = mine ? 'You' : t.playerName;
     $('verdict').className = 'verdict ' + r.outcome;
     $('verdict-title').textContent = {
-      correct: 'Correct! +' + r.points,
+      correct: (r.match === 'close' ? 'Close enough! +' : 'Correct! +') + r.points,
       wrong: 'Not quite',
       revealed: 'Answer revealed',
       skipped: 'Song skipped',
     }[r.outcome];
     var sub;
-    if (r.outcome === 'correct') sub = who + (r.extended ? ' got it with the extra 10 seconds.' : ' got it in 5 seconds!');
+    if (r.outcome === 'correct') sub = who + (r.extended ? ' got it with the extra ' + secs(clipExtend()) + ' seconds.' : ' got it in ' + secs(clipFirst()) + ' seconds!');
     else if (r.outcome === 'wrong') sub = r.guess ? who + ' guessed “' + r.guess + '”. No points.' : 'No points this time.';
     else sub = (mine ? '' : t.playerName + ': ') + 'No points this time.';
     $('verdict-sub').textContent = sub;
@@ -1962,6 +2217,7 @@
   function init() {
     $('setup-form').addEventListener('submit', function (e) {
       e.preventDefault();
+      if (soundPref() === 'spotify') spCtl.activate(); // inside the tap (in-browser player)
       var exclude = !$('exclude-wrap').hidden && $('exclude-used').checked;
       startFromSetup(readSetup(), exclude);
     });
@@ -1971,6 +2227,41 @@
       refreshExcludeHint();
     });
     $('url-input').addEventListener('input', refreshExcludeHint);
+    // Sound: previews or full songs via Spotify.
+    document.querySelectorAll('input[name="engine"]').forEach(function (r) {
+      r.addEventListener('change', function () {
+        if (!r.checked) return;
+        setSoundPref(r.value);
+        soundStatus('');
+        renderSound();
+        if (r.value === 'spotify') ensureSpotifyReady();
+      });
+    });
+    $('sp-client-save').addEventListener('click', function () { if (onClientIdSave()) renderSound(); });
+    $('sp-client-toggle').addEventListener('click', function () { clientFieldOpen = true; renderSound(); $('sp-client-id').focus(); });
+    $('sp-client-default').addEventListener('click', function () {
+      spAuth.setClientId('');
+      clientFieldOpen = false;
+      soundStatus('Using this site’s Spotify app.');
+      renderSound();
+    });
+    $('sp-client-id').addEventListener('keydown', function (e) { if (e.key === 'Enter') { e.preventDefault(); onClientIdSave(); } });
+    $('sp-signin').addEventListener('click', signIn);
+    $('sp-signout').addEventListener('click', signOut);
+    $('sp-refresh').addEventListener('click', function () { soundStatus(''); refreshDevices(); });
+    $('round-device-refresh').addEventListener('click', function () { refreshDevices(); });
+    $('sp-device').addEventListener('change', onDevicePicked);
+    $('round-device-select').addEventListener('change', onDevicePicked);
+    $('sp-test').addEventListener('click', onTestSound);
+    $('auth-banner-signin').addEventListener('click', signIn);
+    spCtl.onSdkStatus(function () { renderDevices(); });
+    spAuth.onChange(function (ev) {
+      if (ev.type === 'signed-out' && ev.reason === 'expired') {
+        spReadyStarted = false;
+        if (game && currentEngineName() === 'spotify') showAuthBanner();
+      }
+      if (currentScreen === 'setup') renderSound();
+    });
     $('play-btn').addEventListener('click', onPlayClick);
     $('extend-btn').addEventListener('click', onExtendClick);
     $('answer-free').addEventListener('submit', function (e) {
@@ -2000,6 +2291,7 @@
     });
     // Rooms: setup buttons, join form, lobby, player screens.
     $('host-btn').addEventListener('click', function () {
+      if (soundPref() === 'spotify') spCtl.activate();
       var exclude = !$('exclude-wrap').hidden && $('exclude-used').checked;
       hostFromSetup(readSetup(), exclude);
     });
@@ -2083,6 +2375,7 @@
     var restored = false;
     try { restored = restoreRoom() || restore(); } catch (e) { if (window.console) console.error(e); }
     if (!restored) goToSetup();
+    if (spRedirect) finishSignIn(spRedirect);
   }
 
   init();
