@@ -224,3 +224,237 @@ test('startTurn stores a clipStart on the current turn, driven by the game\'s cl
   assert.ok(Number.isInteger(randomGame.current.clipStart));
   assert.ok(randomGame.current.clipStart >= 0 && randomGame.current.clipStart <= 15);
 });
+
+// ---------- Free-answer matching: table-driven ----------
+
+// [title, artist, guess, expected] where expected is 'exact' | 'close' (accepted) or false (rejected).
+const FREE_ANSWER_CASES = [
+  // The screenshot bug: part suffix + remaster note on the title, "artist - title" guess.
+  ['Another Brick In The Wall, Pt. 2 - 2011 Remastered Version', 'Pink Floyd', 'Pink Floyd - Another Brick in the Wall', 'exact'],
+  ['Another Brick In The Wall, Pt. 2 - 2011 Remastered Version', 'Pink Floyd', 'another brick in the wall', 'exact'],
+  ['Another Brick In The Wall, Pt. 2 - 2011 Remastered Version', 'Pink Floyd', 'pink floyd another brick in the wall', 'exact'],
+  ['Another Brick In The Wall, Pt. 2 - 2011 Remastered Version', 'Pink Floyd', 'Pink Floyd: Another Brick in the Wall', 'exact'],
+  ['Another Brick In The Wall, Pt. 2 - 2011 Remastered Version', 'Pink Floyd', 'another brick in the wall by pink floyd', 'exact'],
+  ['Another Brick In The Wall, Pt. 2 - 2011 Remastered Version', 'Pink Floyd', 'Another Brick in the Wall - Pink Floyd', 'exact'],
+  ['Another Brick In The Wall, Pt. 2 - 2011 Remastered Version', 'Pink Floyd', 'Another Brick in the Wall Pt. 2', 'exact'],
+  ['Another Brick In The Wall, Pt. 2 - 2011 Remastered Version', 'Pink Floyd', 'another brick in the wall part II', 'exact'],
+  ['Another Brick In The Wall, Pt. 2 - 2011 Remastered Version', 'Pink Floyd', 'Another Brick in the Wall (Part Two)', 'exact'],
+  ['Another Brick In The Wall, Pt. 2 - 2011 Remastered Version', 'Pink Floyd', 'another brick in the wall 2', 'exact'],
+  ['Another Brick In The Wall, Pt. 2 - 2011 Remastered Version', 'Pink Floyd', 'anothr brick in the wall', 'close'],
+  ['Another Brick In The Wall, Pt. 2 - 2011 Remastered Version', 'Pink Floyd', 'Another Brick in the Wall Pt. 1', false],
+  ['Another Brick In The Wall, Pt. 2 - 2011 Remastered Version', 'Pink Floyd', 'another brick in the wall part 3', false],
+  ['Another Brick In The Wall, Pt. 2 - 2011 Remastered Version', 'Pink Floyd', 'another brick in the wall 3', false],
+  ['Another Brick In The Wall, Pt. 2 - 2011 Remastered Version', 'Pink Floyd', 'Pink Floyd', false],
+  ['Another Brick In The Wall, Pt. 2 - 2011 Remastered Version', 'Pink Floyd', 'Pink Floyd - Comfortably Numb', false],
+  ['Another Brick In The Wall, Pt. 2 - 2011 Remastered Version', 'Pink Floyd', 'the wall', false],
+  ['Another Brick In The Wall, Pt. 2 - 2011 Remastered Version', 'Pink Floyd', 'Another Brick In The Wall, Pt. 2 - 2011 Remastered Version', 'exact'],
+  ['Another Brick In The Wall - Part 2', 'Pink Floyd', 'another brick in the wall', 'exact'],
+  ['Another Brick In The Wall - Part 2', 'Pink Floyd', 'another brick in the wall part 1', false],
+  ['Money, Vol. 2', 'X', 'money', 'exact'],
+  ['Money', 'X', 'money pt 2', false],
+
+  // Decorations on the canonical title.
+  ['Bohemian Rhapsody - Remastered 2011', 'Queen', 'Bohemian Rhapsody', 'exact'],
+  ['Bohemian Rhapsody - Remastered 2011', 'Queen', 'bohemian rapsody', 'close'],
+  ['Bohemian Rhapsody - Remastered 2011', 'Queen', 'queen bohemian rhapsody', 'exact'],
+  ['Bohemian Rhapsody - Remastered 2011', 'Queen', 'Bohemian Rhapsody (Remastered)', 'exact'],
+  ['Bohemian Rhapsody - Remastered 2011', 'Queen', 'Bohemian Rhapsody - Live', 'exact'],
+  ['Bohemian Rhapsody - Remastered 2011', 'Queen', 'Bohemian Rhapsody - Remastered 2011', 'exact'],
+  ['Bohemian Rhapsody - Remastered 2011', 'Queen', 'Killer Queen', false],
+  ["Don't Stop Me Now - Remastered 2011", 'Queen', 'dont stop me now', 'exact'],
+  ["Don't Stop Me Now - Remastered 2011", 'Queen', "don't stop me now!", 'exact'],
+  ["Don't Stop Me Now - Remastered 2011", 'Queen', 'dont stop believin', false],
+  ['Under Pressure - Remastered 2011', 'Queen, David Bowie', 'under pressure', 'exact'],
+  ['Under Pressure - Remastered 2011', 'Queen, David Bowie', 'David Bowie - Under Pressure', 'exact'],
+  ['Under Pressure - Remastered 2011', 'Queen, David Bowie', 'Bohemian Rhapsody', false],
+  ['Hotel California - 2013 Remaster', 'Eagles', 'hotel california', 'exact'],
+  ['Hotel California - 2013 Remaster', 'Eagles', 'hotel califronia', 'close'],
+  ['Hotel California - 2013 Remaster', 'Eagles', 'the eagles - hotel california', 'exact'],
+  ['Hey Jude - Remastered 2015', 'The Beatles', 'hey jude', 'exact'],
+  ['Hey Jude - Remastered 2015', 'The Beatles', 'Hey Jude by the Beatles', 'exact'],
+  ['Hey Jude - Remastered 2015', 'The Beatles', 'hey', false],
+  ['Hey Jude - Remastered 2015', 'The Beatles', 'Let It Be', false],
+  ['I Want To Hold Your Hand - Remastered 2015', 'The Beatles', 'i want to hold your hand', 'exact'],
+  ['I Want To Hold Your Hand - Remastered 2015', 'The Beatles', 'i wanna hold your hand', 'close'],
+  ['I Want To Hold Your Hand - Remastered 2015', 'The Beatles', 'hold your hand', false],
+  ['Stayin\' Alive - From "Saturday Night Fever" Soundtrack', 'Bee Gees', 'stayin alive', 'exact'],
+  ['Stayin\' Alive - From "Saturday Night Fever" Soundtrack', 'Bee Gees', 'staying alive', 'close'],
+  ['Stayin\' Alive - From "Saturday Night Fever" Soundtrack', 'Bee Gees', 'saturday night fever', false],
+  ['(I Can\'t Get No) Satisfaction - Mono Version', 'The Rolling Stones', 'satisfaction', 'exact'],
+  ['(I Can\'t Get No) Satisfaction - Mono Version', 'The Rolling Stones', "I can't get no satisfaction", 'exact'],
+  ['(I Can\'t Get No) Satisfaction - Mono Version', 'The Rolling Stones', 'cant get no satisfaction', 'close'],
+  ['(I Can\'t Get No) Satisfaction - Mono Version', 'The Rolling Stones', 'rolling stones satisfaction', 'exact'],
+  ['Paranoid - 2012 - Remaster', 'Black Sabbath', 'paranoid', 'exact'],
+  ['Paranoid - 2012 - Remaster', 'Black Sabbath', 'iron man', false],
+  ['Paranoid - 2012 - Remaster', 'Black Sabbath', 'paranoia', 'close'], // one letter off in an 8-letter title
+  ['Jump - 2015 Remaster', 'Van Halen', 'jump', 'exact'],
+  ['Jump - 2015 Remaster', 'Van Halen', 'jumo', false],
+  ['Song 2 - 2012 Remaster', 'Blur', 'song 2', 'exact'],
+  ['Song 2 - 2012 Remaster', 'Blur', 'song two', 'exact'],
+  ['Song 2 - 2012 Remaster', 'Blur', 'song', false],
+  ['Song 2 - 2012 Remaster', 'Blur', 'song 3', false],
+  ['One - Remastered', 'Metallica', 'one', 'exact'],
+  ['One - Remastered', 'Metallica', 'One - Metallica', 'exact'],
+  ['One - Remastered', 'Metallica', 'won', false],
+  ['Wonderwall - Remastered', 'Oasis', 'wonderwall', 'exact'],
+  ['Wonderwall - Remastered', 'Oasis', 'wonder wall', 'exact'],
+  ['Wonderwall - Remastered', 'Oasis', 'wonderwal', 'close'],
+  ['Smells Like Teen Spirit - Remastered 2021', 'Nirvana', 'Smells Like Teen Spirit', 'exact'],
+  ['Smells Like Teen Spirit', 'Nirvana', 'smells like teen spirt', 'close'],
+  ['Smells Like Teen Spirit', 'Nirvana', 'teen spirit', false],
+  ['Smells Like Teen Spirit', 'Nirvana', 'nirvana', false],
+  ['Radio Ga Ga - Live at Wembley', 'Queen', 'radio ga ga', 'exact'],
+  ['Losing My Religion - Radio Edit', 'R.E.M.', 'losing my religion', 'exact'],
+  ['Heroes - Single Version', 'David Bowie', 'heroes', 'exact'],
+  ['Heroes - Single Version', 'David Bowie', 'hero', false],
+  ['Levels - Original Mix', 'Avicii', 'levels', 'exact'],
+  ['Heat Waves [Explicit]', 'Glass Animals', 'heat waves', 'exact'],
+  ['Cold Heart (PNAU Remix) - Extended Mix', 'Elton John, Dua Lipa', 'cold heart', 'exact'],
+  ['Summer Nights - 1999', 'X', 'summer nights', 'exact'],
+  ['Summer Nights - Acoustic', 'X', 'summer nights', 'exact'],
+  ['Summer Nights - Deluxe', 'X', 'summer nights', 'exact'],
+  ['Summer Nights - Spotify Singles', 'X', 'summer nights', 'exact'],
+  ['Mr. Blue Sky', 'Electric Light Orchestra', 'Mr Blue Sky Part 2', false], // the title has no part
+
+  // Plain real-world titles and typical human guesses.
+  ['Africa', 'TOTO', 'africa', 'exact'],
+  ['Africa', 'TOTO', 'toto africa', 'exact'],
+  ['Africa', 'TOTO', 'america', false],
+  ['Africa', 'TOTO', 'afrika', 'close'], // one edit allowed from 6 letters
+  ['Africa', 'TOTO', 'afric', 'close'],
+  ['Africa', 'TOTO', 'afrikka', false],
+  ['Zombie', 'The Cranberries', 'zombi', 'close'],
+  ['Heroes', 'David Bowie', 'hero', false],
+  ['Hello', 'Adele', 'Hallo', false], // 5 letters: still exact (bar doubled letters)
+  ['Hallo', 'X', 'Hello', false],
+  ['Mr. Brightside', 'The Killers', 'brightside', 'close'],
+  ['Mr. Brightside', 'The Killers', 'brightsid', 'close'],
+  ['Mr. Brightside', 'The Killers', 'mr brightsid', 'close'],
+  ['Mr. Jones', 'Counting Crows', 'mr jones', 'exact'],
+  ['Mr. Jones', 'Counting Crows', 'mister jones', 'exact'],
+  ['Mr. Jones', 'Counting Crows', 'jones', false], // too short to drop the honorific
+  ['Mrs. Robinson', 'Simon & Garfunkel', 'robinson', 'close'],
+  ['Dr. Feelgood', 'Motley Crue', 'feelgood', 'close'],
+  ['Mr. Blue Sky', 'Electric Light Orchestra', 'mr blue sky', 'exact'],
+  ['Mr. Blue Sky', 'Electric Light Orchestra', 'blue sky', 'close'],
+  ['Mr. Blue Sky', 'Electric Light Orchestra', 'sky', false],
+  ['Mr. Brightside', 'The Killers', 'mr brightside', 'exact'],
+  ['Mr. Brightside', 'The Killers', 'mister brightside', 'exact'],
+  ['Mr. Brightside', 'The Killers', 'the killers - mr. brightside', 'exact'],
+  ["Sweet Child O' Mine", "Guns N' Roses", 'sweet child o mine', 'exact'],
+  ["Sweet Child O' Mine", "Guns N' Roses", 'sweet child of mine', 'close'],
+  ["Sweet Child O' Mine", "Guns N' Roses", 'guns and roses sweet child o mine', 'exact'],
+  ["Sweet Child O' Mine", "Guns N' Roses", 'sweet child', false],
+  ['Everybody Wants To Rule The World', 'Tears For Fears', 'everybody wants to rule the world', 'exact'],
+  ['Everybody Wants To Rule The World', 'Tears For Fears', 'everyone wants to rule the world', 'close'],
+  ['Everybody Wants To Rule The World', 'Tears For Fears', 'rule the world', false],
+  ["Baba O'Riley", 'The Who', 'baba o riley', 'exact'],
+  ["Baba O'Riley", 'The Who', 'baba oreilly', 'close'],
+  ["Baba O'Riley", 'The Who', 'teenage wasteland', false],
+  ['Blinding Lights', 'The Weeknd', 'blinding lights', 'exact'],
+  ['Blinding Lights', 'The Weeknd', 'blinding light', 'close'],
+  ['Blinding Lights', 'The Weeknd', 'Save Your Tears', false],
+  ['Bad Romance', 'Lady Gaga', 'bad romance', 'exact'],
+  ['Bad Romance', 'Lady Gaga', 'bad romanse', 'close'],
+  ['Bad Romance', 'Lady Gaga', 'bad', false],
+  ['HUMBLE.', 'Kendrick Lamar', 'humble', 'exact'],
+  ['HUMBLE.', 'Kendrick Lamar', 'kendrick lamar humble', 'exact'],
+  ['HUMBLE.', 'Kendrick Lamar', 'DNA.', false],
+  ['...Baby One More Time', 'Britney Spears', 'baby one more time', 'exact'],
+  ['...Baby One More Time', 'Britney Spears', 'baby 1 more time', 'exact'],
+  ['...Baby One More Time', 'Britney Spears', 'one more time', false],
+  ["Livin' On A Prayer", 'Bon Jovi', 'livin on a prayer', 'exact'],
+  ["Livin' On A Prayer", 'Bon Jovi', 'living on a prayer', 'close'],
+  ["Livin' On A Prayer", 'Bon Jovi', 'bon jovi - living on a prayer', 'close'],
+  ["Livin' On A Prayer", 'Bon Jovi', 'on a prayer', false],
+  ['Sultans of Swing', 'Dire Straits', 'sultans of swing', 'exact'],
+  ['Sultans of Swing', 'Dire Straits', 'sultan of swing', 'close'],
+  ['Sultans of Swing', 'Dire Straits', 'money for nothing', false],
+  ['September', 'Earth, Wind & Fire', 'september', 'exact'],
+  ['September', 'Earth, Wind & Fire', 'septmeber', 'close'],
+  ['September', 'Earth, Wind & Fire', 'earth wind and fire september', 'exact'],
+  ['September', 'Earth, Wind & Fire', 'december', false],
+  ['Zombie', 'The Cranberries', 'zombie', 'exact'],
+  ['Zombie', 'The Cranberries', 'zombies', 'close'],
+  ['Zombie', 'The Cranberries', 'linger', false],
+  ['Bittersweet Symphony', 'The Verve', 'bitter sweet symphony', 'exact'],
+  ['Bittersweet Symphony', 'The Verve', 'bittersweet symphonie', 'close'],
+  ['Bittersweet Symphony', 'The Verve', 'symphony', false],
+  ['Nothing Else Matters', 'Metallica', 'nothing else matters', 'exact'],
+  ['Nothing Else Matters', 'Metallica', 'nothing else matter', 'close'],
+  ['Nothing Else Matters', 'Metallica', 'nothing matters', false],
+  ['Nothing Else Matters', 'Metallica', 'Metallica - One', false],
+  ['Boulevard of Broken Dreams', 'Green Day', 'boulevard of broken dreams', 'exact'],
+  ['Boulevard of Broken Dreams', 'Green Day', 'boulevard of broken dream', 'close'],
+  ['Boulevard of Broken Dreams', 'Green Day', 'broken dreams', false],
+
+  // Numbers in the core title must match; number words count.
+  ['7 rings', 'Ariana Grande', 'seven rings', 'exact'],
+  ['seven rings', 'Ariana Grande', '7 rings', 'exact'],
+  ['7 rings', 'Ariana Grande', '8 rings', false],
+  ['7 rings', 'Ariana Grande', 'eight rings', false],
+  ['22', 'Taylor Swift', '22', 'exact'],
+  ['22', 'Taylor Swift', 'twenty two', 'exact'],
+  ['22', 'Taylor Swift', '23', false],
+  ['1979 - Remastered 2012', 'The Smashing Pumpkins', '1979', 'exact'],
+  ['1979 - Remastered 2012', 'The Smashing Pumpkins', '1978', false],
+
+  // Word order / article slips (token sets ignoring the, a, an, of, in, on, to, and).
+  ['The Sound of Silence', 'Simon & Garfunkel', 'sound of silence', 'exact'],
+  ['The Sound of Silence', 'Simon & Garfunkel', 'the sounds of silence', 'close'],
+  ['Die With A Smile', 'Lady Gaga, Bruno Mars', 'die with smile', 'close'],
+  ['Title: The Subtitle Here', 'X', 'title', false],
+  ['Heart of Glass: Special Edition', 'Blondie', 'heart of glass', 'exact'],
+  ['Stairway to Heaven, Live in Tokyo', 'Led Zeppelin', 'stairway to heaven', 'exact'],
+  ['Stairway to Heaven, Live in Tokyo - 2012 Remaster', 'Led Zeppelin', 'stairway to heaven', 'exact'],
+  ['Pomp and Circumstance: March No. 1', 'Edward Elgar', 'pomp and circumstance', 'close'], // up to the colon
+
+  // Negatives that must stay rejected.
+  ['Stay With Me', 'Sam Smith', 'stay', false],
+  ['Die With A Smile', 'Lady Gaga, Bruno Mars', 'die', false],
+  ['Hello Goodbye', 'The Beatles', 'Hello', false],
+  ['Hello, Goodbye - Remastered 2009', 'The Beatles', 'Hello', false],
+  ['Yesterday Once More', 'Carpenters', 'Yesterday', false],
+  ['Hello', 'Adele', 'yesterday / hello', false],
+  ['Hello', 'Adele', 'hello / yesterday', false],
+  ['Hello', 'Adele', 'Hello - Stay With Me', false],
+  ['Hello', 'Adele', 'adele', false],
+  ['Hello', 'Adele', '   ', false],
+  ['Hello', 'Adele', '', false],
+  ['Hello', 'Adele', 'Helo', 'close'],
+  ['Hello', 'Adele', 'Hello - Adele', 'exact'],
+];
+
+test('matchFreeAnswer: table of real-world titles and human guesses', () => {
+  assert.ok(FREE_ANSWER_CASES.length >= 40);
+  const failures = [];
+  for (const [title, artist, guess, expected] of FREE_ANSWER_CASES) {
+    const r = G.matchFreeAnswer(guess, T('x', title, artist));
+    const got = r.ok ? r.kind : false;
+    if (got !== expected) failures.push(`${JSON.stringify(guess)} for ${JSON.stringify(title)}: expected ${expected}, got ${got}`);
+    assert.equal(G.checkAnswer(guess, T('x', title, artist)), r.ok, 'checkAnswer agrees with matchFreeAnswer');
+  }
+  assert.deepEqual(failures, []);
+});
+
+test('matchFreeAnswer reports what matched, and answer() records exact vs close on the turn', () => {
+  const wall = T('w', 'Another Brick In The Wall, Pt. 2 - 2011 Remastered Version', 'Pink Floyd');
+  assert.deepEqual(G.matchFreeAnswer('Pink Floyd - Another Brick in the Wall', wall),
+    { ok: true, kind: 'exact', matched: 'another brick in the wall', guess: 'another brick in the wall' });
+  assert.deepEqual(G.matchFreeAnswer('nope', wall), { ok: false, kind: 'none', matched: null, guess: null });
+  assert.deepEqual(G.extractPart('Another Brick In The Wall, Pt. II'), { text: 'Another Brick In The Wall', part: '2' });
+  assert.deepEqual(G.extractPart('Part of Me'), { text: 'Part of Me', part: null });
+
+  const tracks = [wall, T('b', 'Bohemian Rhapsody - Remastered 2011', 'Queen'), T('c', 'Zombie', 'The Cranberries')];
+  const game = G.createGame({ players: ['A'], mode: 'free', rounds: 0, tracks });
+  const verdicts = {};
+  const guesses = { w: 'pink floyd another brick in the wall', b: 'bohemian rapsody', c: 'linger' };
+  G.startTurn(game);
+  while (game.phase !== 'over') {
+    const id = game.current.trackId;
+    G.answer(game, 'guess', guesses[id]);
+    verdicts[id] = [game.current.outcome, game.current.match, game.current.points];
+    G.nextTurn(game);
+  }
+  assert.deepEqual(verdicts, { w: ['correct', 'exact', 10], b: ['correct', 'close', 10], c: ['wrong', 'none', 0] });
+});
