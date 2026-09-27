@@ -439,3 +439,115 @@ test('switching the device mid-clip pauses the device that was playing, not the 
   await clock.advance(100);
   assert.deepEqual(calls, [['play', 'kitchen', 0], ['pause', 'kitchen']]);
 });
+
+// ---------- Playing in sync with other devices ----------
+
+function fakeAudioEl() {
+  const listeners = {};
+  const audio = {
+    currentTime: 0, duration: 30, readyState: 4, paused: true, muted: false, seeking: false, playbackRate: 1, attrs: {}, plays: 0,
+    addEventListener: (n, fn) => { (listeners[n] = listeners[n] || []).push(fn); },
+    removeEventListener: () => {},
+    getAttribute: (k) => audio.attrs[k] || null,
+    removeAttribute: (k) => { delete audio.attrs[k]; },
+    set src(v) { audio.attrs.src = v; },
+    get src() { return audio.attrs.src || ''; },
+    load: () => {},
+    play: () => { audio.plays++; if (audio.block) return Promise.reject(Object.assign(new Error('no'), { name: 'NotAllowedError' })); audio.paused = false; return Promise.resolve(); },
+    pause: () => { audio.paused = true; },
+  };
+  return audio;
+}
+
+test('preview engine: playSynced starts at the shared start time, joins late at the others\' position, skips a finished clip', async () => {
+  const audio = fakeAudioEl();
+  const frames = [];
+  const e = ClipEngine.createPreviewEngine({ createAudio: () => audio, raf: (f) => { frames.push(f); return frames.length; }, caf: () => {} });
+  const ended = [];
+  const errors = [];
+  e.onEnded((i) => ended.push(i));
+  e.onError((m, err) => errors.push(err.code));
+  e.load({ previewUrl: 'https://p.scdn.co/mp3-preview/x' });
+  let now = 1000;
+  const clock = () => now;
+  // Scheduled 300 ms ahead: seeked at once (to buffer), not started yet.
+  assert.equal(e.playSynced(12000, 17000, 1300, clock), true);
+  assert.equal(audio.currentTime, 12);
+  assert.equal(audio.plays, 0);
+  await new Promise((r) => setTimeout(r, 320)); // (real timer: the start is a setTimeout)
+  assert.equal(audio.plays, 1, 'started at the start time');
+  // Drift: 60 ms behind the timeline -> slightly faster; far behind -> seek.
+  now = 1300 + 1000;
+  audio.currentTime = 12.94;
+  frames.shift()();
+  assert.equal(audio.playbackRate, 1.06);
+  audio.currentTime = 13.0;
+  frames.shift()();
+  assert.equal(audio.playbackRate, 1, 'back to normal speed once aligned');
+  now = 1300 + 2000;
+  audio.currentTime = 13.5; // 500 ms behind
+  frames.shift()();
+  assert.ok(Math.abs(audio.currentTime - 14.03) < 0.001, 'seeked to the timeline');
+  // The end is local: stop at 17 s.
+  audio.currentTime = 17.0;
+  frames.shift()();
+  assert.equal(e.playing, false);
+  assert.equal(ended.length, 1);
+  // A late device (the tap to enable sound came 2.5 s in) starts mid-clip.
+  now = 10000;
+  e.playSynced(12000, 17000, 7500, clock);
+  assert.equal(audio.currentTime, 14.5);
+  assert.equal(audio.plays, 2);
+  e.stop();
+  assert.equal(audio.playbackRate, 1);
+  // Already over: nothing plays.
+  assert.equal(e.playSynced(12000, 17000, 4000, clock), false);
+  assert.equal(ended.at(-1).missed, true);
+  // Blocked by the browser: reported as 'blocked'.
+  audio.block = true;
+  e.playSynced(12000, 17000, 10000, clock);
+  await new Promise((r) => setImmediate(r));
+  assert.deepEqual(errors, ['blocked']);
+  assert.equal(e.playing, false);
+});
+
+test('preview engine: unlock() plays the element muted inside a tap (silence when nothing is loaded)', async () => {
+  const audio = fakeAudioEl();
+  const e = ClipEngine.createPreviewEngine({ createAudio: () => audio });
+  e.unlock();
+  assert.equal(audio.plays, 1);
+  assert.equal(audio.muted, true);
+  assert.equal(audio.attrs.src, ClipEngine.SILENT_WAV);
+  await new Promise((r) => setImmediate(r));
+  assert.equal(e.unlocked, true);
+  assert.equal(audio.muted, false);
+  assert.equal(audio.attrs.src, undefined, 'the silence is taken out again');
+  assert.equal(audio.paused, true);
+});
+
+test('spotify engine: playSynced waits for the start time and starts late devices further in', async () => {
+  const clock = fakeClock();
+  const device = fakeDevice(clock, { latency: 100 });
+  const { e } = engineWith(clock, device);
+  e.load({ id: 'abc', uri: 'spotify:track:abc', durationMs: 200000 });
+  e.playSynced(30000, 35000, 500, clock.now);
+  await clock.advance(400);
+  assert.equal(device.log.filter((x) => x.type === 'play').length, 0, 'not before the start time');
+  await clock.advance(200);
+  assert.equal(device.log.find((x) => x.type === 'play').ms, 30000);
+  e.stop();
+  await clock.advance(500);
+  // 2 s late: starts 2 s into the segment.
+  e.playSynced(30000, 35000, clock.t - 2000, clock.now);
+  await clock.advance(100);
+  assert.equal(device.log.filter((x) => x.type === 'play').at(-1).ms, 32000);
+  e.stop();
+  // Stopped (a halt, the next turn, leaving) before the start time: it never starts,
+  // although `playing` is still false while it waits (so callers must stop() anyway).
+  const plays = device.log.filter((x) => x.type === 'play').length;
+  e.playSynced(30000, 35000, clock.t + 800, clock.now);
+  assert.equal(e.playing, false);
+  e.stop();
+  await clock.advance(1500);
+  assert.equal(device.log.filter((x) => x.type === 'play').length, plays, 'no play after the stop');
+});

@@ -25,6 +25,16 @@
   <div id="conn-banner" class="conn-banner" role="status" hidden></div>
   <div id="auth-banner" class="conn-banner bad" role="status" hidden><span id="auth-banner-text"></span> <button type="button" class="btn-link" id="auth-banner-signin">Sign in again</button></div>
   <div id="scoreboard" class="scoreboard" aria-label="Scoreboard" hidden></div>
+  <!-- Phone in a room, sound on every device: blocked sound, full songs via Spotify on this phone -->
+  <div id="p-sound" class="p-sound" role="status" hidden>
+    <span id="p-sound-text"></span>
+    <button type="button" class="btn btn-primary btn-small" id="p-sound-enable" hidden>Tap to enable sound</button>
+    <button type="button" class="btn btn-spotify btn-small" id="p-sp-signin" hidden>Sign in with Spotify to hear full songs on this phone</button>
+    <span class="link-row" id="p-sp-devices" hidden>
+      <select id="p-sp-device" aria-label="Spotify device for this phone"></select>
+      <button type="button" class="btn-link" id="p-sp-refresh">Refresh</button>
+    </span>
+  </div>
 
   <main id="app">
     <!-- SETUP -->
@@ -118,7 +128,7 @@
                   <button type="button" class="btn-link" id="sp-client-default" hidden>Use this site’s app instead</button></p>
               </div>
               <button type="button" class="btn btn-spotify" id="sp-signin">Sign in with Spotify</button>
-              <p class="hint">Only the host signs in. Your sign-in stays in this browser.</p>
+              <p class="hint">The host signs in here; players can sign in on their own phones to hear full songs there too. Your sign-in stays in this browser.</p>
               <button type="button" class="btn-link sp-other-app" id="sp-client-toggle" hidden>Use a different Spotify app</button>
             </div>
             <div class="sp-signed-in" id="sp-signed-in" hidden>
@@ -132,6 +142,14 @@
               <div><button type="button" class="btn btn-ghost btn-small" id="sp-test">Test sound</button></div>
             </div>
             <p class="hint sp-status" id="sp-status" role="status" hidden></p>
+          </div>
+          <div class="sound-on">
+            <span class="sound-on-label" id="sound-on-label">Sound plays on (rooms)</span>
+            <div class="segmented" role="radiogroup" aria-labelledby="sound-on-label">
+              <label><input type="radio" name="sound-on" value="all" checked><span>Every player’s device</span></label>
+              <label><input type="radio" name="sound-on" value="host"><span>Host device only</span></label>
+            </div>
+            <p class="hint" id="sound-on-hint">With previews every phone plays the clip in sync; with full songs only phones signed in to Spotify (Premium) do, and the others hear the host’s device.</p>
           </div>
         </fieldset>
 
@@ -160,7 +178,7 @@
           <button type="button" class="btn btn-ghost" id="host-btn">Host a room</button>
           <button type="button" class="btn btn-ghost" id="join-btn">Join a room</button>
         </div>
-        <p class="hint">Host a room: this device is the “TV” and plays the songs; players join with a room code on their phones and answer there. (The player list above is for pass-the-phone only.)</p>
+        <p class="hint">Host a room: this device is the “TV”; players join with a room code on their phones and answer there, and the songs play on every phone or only here (see “Sound plays on”). (The player list above is for pass-the-phone only.)</p>
       </form>
 
       <details class="howto">
@@ -178,7 +196,7 @@
     <!-- JOIN A ROOM (player) -->
     <section id="screen-join" class="screen" data-screen="join" hidden>
       <h1>Join a room</h1>
-      <p class="lede">Enter the code shown on the host’s screen. The music plays on the host’s device; you answer here.</p>
+      <p class="lede">Enter the code shown on the host’s screen. You answer here, and the music plays on this phone too (unless the host chose to play it on their device only).</p>
       <form id="join-form" novalidate>
         <div class="field">
           <label for="join-code">Room code</label>
@@ -381,6 +399,13 @@
         <button type="button" class="btn btn-ghost btn-block" id="over-leave-btn">Leave the room</button>
       </div>
     </section>
+
+    <!-- Rooms: what the connection is doing, for troubleshooting (filled by app.js) -->
+    <details class="diag" id="diag" hidden>
+      <summary>Connection details</summary>
+      <pre class="diag-text" id="diag-text">…</pre>
+      <button type="button" class="btn btn-ghost btn-small" id="diag-copy">Copy details</button>
+    </details>
   </main>
 
   <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>

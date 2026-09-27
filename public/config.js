@@ -55,14 +55,60 @@ window.GTS_CONFIG = {
   EXAMPLE_SNAPSHOT: 'data/example-playlist.json',
 
   /*
-   * Multiplayer rooms connect phones to the host with WebRTC (PeerJS). null
-   * uses PeerJS's free public signaling server (0.peerjs.com) and its default
-   * STUN/TURN servers. To use your own PeerServer or TURN, pass PeerJS options:
-   *   PEERJS: { host: 'peer.example.com', port: 443, path: '/', secure: true,
-   *             config: { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] } },
-   * Add ?transport=local to the URL to use tabs of one browser instead (testing).
+   * Multiplayer rooms connect phones to the host with WebRTC (PeerJS), using
+   * PeerJS's free public signaling server (0.peerjs.com) unless host/port/path/
+   * key/secure are set here for your own PeerServer:
+   *   PEERJS: { host: 'peer.example.com', port: 443, path: '/', secure: true, iceServers: [...] }
+   *
+   * iceServers: how two devices find a path to each other. STUN finds a
+   * device's public address; TURN relays the traffic when no direct path works
+   * (carrier-grade or symmetric NAT on mobile data, Wi-Fi with client
+   * isolation, guest networks). Without a TURN relay those phones can't join.
+   * The defaults are Google's STUN server and the free Open Relay TURN servers
+   * of metered.ca (https://www.metered.ca/tools/openrelay/). Open Relay is a
+   * free, best-effort service (about 20 GB a month shared by everyone using
+   * these credentials, no uptime guarantee). For reliable games, put your own
+   * TURN credentials first, e.g. a free metered.ca account's:
+   *   { urls: ['turn:<you>.relay.metered.ca:80', 'turns:<you>.relay.metered.ca:443?transport=tcp'],
+   *     username: '...', credential: '...' },
+   * An entry with `authSecret` (instead of username/credential) is a TURN
+   * server with a shared secret (the "TURN REST API" / coturn use-auth-secret
+   * scheme): the game makes a time-limited username and credential from it.
+   * Open Relay publishes its secret for exactly this use; these credentials
+   * are public, not private.
+   *
+   * iceTransportPolicy: 'all' (default) or 'relay' (TURN only; also per visit
+   * with ?ice=relay). A phone whose join fails because no path worked
+   * (ICE failed) retries with 'relay' by itself.
+   * Add ?transport=local to the URL to use tabs of one browser instead (testing),
+   * and ?debug=1..3 for PeerJS logs in the browser console.
    */
-  PEERJS: null,
+  PEERJS: {
+    iceServers: [
+      { urls: 'stun:stun.l.google.com:19302' },
+      // Open Relay (metered.ca), static-auth TURN, as published on the page above in September 2026.
+      {
+        urls: [
+          'turn:staticauth.openrelay.metered.ca:80',
+          'turn:staticauth.openrelay.metered.ca:80?transport=tcp',
+          'turn:staticauth.openrelay.metered.ca:443?transport=tcp',
+        ],
+        authSecret: 'openrelayprojectsecret',
+      },
+      // Open Relay's older public username/password (no longer listed on the page; kept as a fallback).
+      {
+        urls: [
+          'turn:openrelay.metered.ca:80',
+          'turn:openrelay.metered.ca:443',
+          'turn:openrelay.metered.ca:443?transport=tcp',
+          'turns:openrelay.metered.ca:443?transport=tcp',
+        ],
+        username: 'openrelayproject',
+        credential: 'openrelayproject',
+      },
+    ],
+    iceTransportPolicy: 'all',
+  },
 
   /*
    * "Full songs via Spotify": the Client ID of the Spotify app used to sign in

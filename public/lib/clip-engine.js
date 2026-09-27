@@ -8,7 +8,17 @@
  *                                           play [start, end); with offsetFn(durationMs) -> ms the
  *                                           segment is shifted by the song's clip start, placed once
  *                                           the duration is known
+ *   engine.playSynced(startMs, endMs, atMs, clock)
+ *                                           play [start, end) of the song in sync with other
+ *                                           devices: the segment starts at `atMs` on clock() (a
+ *                                           device that starts late joins at the position the
+ *                                           others are at; one that is past the end skips it).
+ *                                           Previews also correct drift while playing (playback
+ *                                           rate nudges, a seek when far off).
  *   engine.stop() / unload() / prime()      prime(): call inside a tap so later playback is allowed
+ *   engine.unlock()                         previews: play the element muted inside a tap (a
+ *                                           silent sound if nothing is loaded), so audio started
+ *                                           later from the network (no tap) is allowed on mobile
  *   engine.playing, segStartMs, segEndMs    (segment in ms of the song, offset included)
  *   engine.positionMs(), durationMs()       (NaN when unknown)
  *   engine.onProgress(fn(ms)), onState(fn('loading'|'playing'|'stopped')),
@@ -59,6 +69,21 @@
 
   function noop() {}
 
+  // A tenth of a second of silence (8 kHz, 8-bit mono WAV) for unlocking audio inside a tap.
+  var SILENT_WAV = (function () {
+    var n = 800;
+    var bytes = [];
+    var str = function (s) { for (var i = 0; i < s.length; i++) bytes.push(s.charCodeAt(i)); };
+    var u32 = function (v) { bytes.push(v & 255, (v >>> 8) & 255, (v >>> 16) & 255, (v >>> 24) & 255); };
+    var u16 = function (v) { bytes.push(v & 255, (v >>> 8) & 255); };
+    str('RIFF'); u32(36 + n); str('WAVE'); str('fmt '); u32(16); u16(1); u16(1); u32(8000); u32(8000); u16(1); u16(8);
+    str('data'); u32(n);
+    for (var i = 0; i < n; i++) bytes.push(128);
+    var bin = String.fromCharCode.apply(null, bytes);
+    var b64 = typeof btoa === 'function' ? btoa(bin) : Buffer.from(bin, 'binary').toString('base64');
+    return 'data:audio/wav;base64,' + b64;
+  })();
+
   function emitter() {
     var ls = { progress: [], state: [], ended: [], error: [] };
     return {
@@ -86,7 +111,7 @@
     var raf = deps.raf || function (f) { return setTimeout(f, 16); };
     var caf = deps.caf || function (id) { clearTimeout(id); };
     var ev = emitter();
-    var e = { kind: 'preview', playing: false, segStartMs: 0, segEndMs: 0, primed: false, priming: false };
+    var e = { kind: 'preview', playing: false, segStartMs: 0, segEndMs: 0, primed: false, priming: false, unlocked: false, synced: null };
     ev.bind(e);
     var a = deps.createAudio();
     a.preload = 'auto';
@@ -96,6 +121,8 @@
     var rafId = 0;
     var safety = 0;
     var token = 0;
+    var syncTimer = 0;
+    var lastSeekAt = 0;
 
     function setSeg(s, en) { segStart = s; segEnd = en; e.segStartMs = s * 1000; e.segEndMs = en * 1000; }
 
@@ -108,7 +135,7 @@
     a.addEventListener('waiting', function () { if (e.playing) ev.fire('state', 'loading'); });
     a.addEventListener('ended', function () { if (e.playing) { e.stop(); ev.fire('ended', { actualMs: (a.currentTime || 0) * 1000, requestedMs: e.segEndMs }); } });
     a.addEventListener('error', function () {
-      if (!a.getAttribute('src')) return;
+      if (!a.getAttribute('src') || a.getAttribute('src') === SILENT_WAV) return;
       e.stop();
       ev.fire('error', 'This song’s preview could not be loaded.', { code: 'preview' });
     });
@@ -153,6 +180,116 @@
       try { p = a.play(); } catch (x) { p = null; }
       if (p && p.then) p.then(done, done); else done();
     };
+
+    /**
+     * Inside a tap (Join, Ready, Play, "Tap to enable sound"): play this element
+     * once, muted, so that clips started later by a network message are allowed
+     * (iOS needs a gesture per element; others remember the page's activation).
+     * Uses the loaded preview, or a tenth of a second of silence.
+     */
+    e.unlock = function () {
+      if (e.playing || e.priming) return;
+      var silent = !a.getAttribute('src');
+      if (silent) a.src = SILENT_WAV;
+      e.priming = true;
+      a.muted = true;
+      var done = function (ok) {
+        if (ok) e.unlocked = true;
+        if (!e.priming) return; // a real play took over
+        e.priming = false;
+        if (!e.playing && !a.paused) a.pause();
+        if (a.getAttribute('src') === SILENT_WAV) { a.removeAttribute('src'); a.load(); }
+        else { try { if (!e.playing && a.readyState >= 1) a.currentTime = 0; } catch (x) { /* ignore */ } }
+        a.muted = false;
+      };
+      var p;
+      try { p = a.play(); } catch (x) { p = null; }
+      if (p && p.then) p.then(function () { done(true); }, function () { done(false); });
+      else done(true);
+    };
+
+    /**
+     * Play [startMs, endMs) of the file in sync with other devices: it should
+     * be at startMs at time `at` of clock(). The element is seeked right away
+     * (so it can buffer), started at `at`, and a device that is late (the
+     * message arrived late, the preview was still loading, the tap to enable
+     * sound came later) starts at the position the others are at. While it
+     * plays, drift from that timeline is corrected: up to 250 ms by playing 6%
+     * faster or slower, beyond that by seeking. Returns false (and fires
+     * 'ended' with missed: true) when the segment is already over.
+     */
+    e.playSynced = function (startMs, endMs, at, clockFn) {
+      var clock = clockFn || function () { return Date.now(); };
+      if (e.priming) { e.priming = false; a.muted = false; if (a.getAttribute('src') === SILENT_WAV) { a.removeAttribute('src'); a.load(); } }
+      e.stop();
+      var my = ++token;
+      setSeg(startMs / 1000, endMs / 1000);
+      var expected = function () { return startMs + (clock() - at); };
+      if (expected() >= endMs - 50) {
+        ev.fire('ended', { missed: true, actualMs: startMs, requestedMs: endMs });
+        return false;
+      }
+      e.playing = true;
+      e.synced = { startMs: startMs, endMs: endMs, at: at, clock: clock };
+      lastSeekAt = 0;
+      ev.fire('state', 'loading');
+      var seekTo = function (ms) { try { a.currentTime = Math.max(startMs, ms) / 1000; } catch (x) { /* ignore */ } };
+      var started = false;
+      if (a.readyState >= 1) seekTo(expected());
+      else {
+        a.addEventListener('loadedmetadata', function onMeta() {
+          a.removeEventListener('loadedmetadata', onMeta);
+          if (my !== token || !e.playing) return;
+          seekTo(started ? expected() + 50 : expected());
+        });
+      }
+      var go = function () {
+        syncTimer = 0;
+        if (my !== token || !e.playing) return;
+        var exp = expected();
+        if (exp >= endMs) { end(); return; }
+        if (a.readyState >= 1 && Math.abs(a.currentTime * 1000 - Math.max(startMs, exp)) > 40) seekTo(exp);
+        started = true;
+        var p = a.play();
+        if (p && p.catch) {
+          p.catch(function (err) {
+            if (my !== token) return;
+            e.stop();
+            if (err && err.name === 'AbortError') return;
+            var blocked = err && err.name === 'NotAllowedError';
+            ev.fire('error', blocked ? 'This browser blocked the sound. Tap to enable it.' : 'This song’s preview could not be played.', { code: blocked ? 'blocked' : 'preview' });
+          });
+        }
+        var loop = function () {
+          if (my !== token || !e.playing) return;
+          correctDrift();
+          check();
+          rafId = raf(loop);
+        };
+        rafId = raf(loop);
+      };
+      var wait = at - clock();
+      if (wait > 4) syncTimer = setTimeout(go, wait);
+      else go();
+      return true;
+    };
+
+    function correctDrift() {
+      var s = e.synced;
+      if (!s || a.paused || a.seeking || a.readyState < 3) return;
+      var t = s.clock();
+      var d = s.startMs + (t - s.at) - a.currentTime * 1000; // > 0: behind the others
+      if (Math.abs(d) > 250) {
+        if (t - lastSeekAt > 1000) {
+          lastSeekAt = t;
+          a.playbackRate = 1;
+          try { a.currentTime = (a.currentTime * 1000 + d + 30) / 1000; } catch (x) { /* ignore */ }
+        }
+        return;
+      }
+      if (Math.abs(d) > 30) a.playbackRate = d > 0 ? 1.06 : 0.94;
+      else if (Math.abs(d) < 10 && a.playbackRate !== 1) a.playbackRate = 1;
+    }
 
     /**
      * Play [startMs, endMs). With `offsetFn`, the segment is shifted by the
@@ -231,9 +368,13 @@
     e.stop = function () {
       var wasPlaying = e.playing;
       e.playing = false;
+      e.synced = null;
       token++;
       caf(rafId);
       clearTimeout(safety);
+      clearTimeout(syncTimer);
+      syncTimer = 0;
+      if (a.playbackRate !== 1) a.playbackRate = 1;
       if (!a.paused) a.pause();
       if (wasPlaying) {
         ev.fire('progress', Math.min(segEnd, a.currentTime || 0) * 1000);
@@ -280,6 +421,7 @@
     var endTimer = null;
     var tickTimer = null;
     var resyncTimer = null;
+    var syncTimer = null;
     // The last pause command. A play waits for it, so the two can't reach the
     // device in the wrong order (and leave the new clip paused).
     var pausing = Promise.resolve();
@@ -302,8 +444,8 @@
     }
 
     function clearTimers() {
-      [endTimer, tickTimer, resyncTimer].forEach(function (t) { if (t != null) timers.clearTimeout(t); });
-      endTimer = tickTimer = resyncTimer = null;
+      [endTimer, tickTimer, resyncTimer, syncTimer].forEach(function (t) { if (t != null) timers.clearTimeout(t); });
+      endTimer = tickTimer = resyncTimer = syncTimer = null;
     }
 
     function estimate() { return running ? base.pos + (now() - base.at) : lastPos; }
@@ -313,6 +455,35 @@
     e.load = function (track) { e.stop(); e.track = track || null; lastPos = 0; };
     e.unload = function () { e.stop(); e.track = null; };
     e.prime = function () { if (ctl.activate) ctl.activate(); };
+    e.unlock = e.prime;
+
+    /**
+     * In sync with other devices: start at `at` on clock(), from the position
+     * the segment has reached by then if this device is late. Spotify's own
+     * start-up delay (Connect: 200-600 ms) isn't corrected here.
+     */
+    e.playSynced = function (startMs, endMs, at, clockFn) {
+      var clock = clockFn || function () { return Date.now(); };
+      e.stop();
+      var my = ++token;
+      var go = function () {
+        syncTimer = null;
+        if (my !== token) return;
+        var late = Math.max(0, clock() - at);
+        if (startMs + late >= endMs - 100) {
+          ev.fire('state', 'stopped');
+          ev.fire('ended', { missed: true, requestedMs: endMs });
+          return;
+        }
+        e.playSegment(startMs + late, endMs);
+      };
+      var wait = at - clock();
+      if (wait > 5) {
+        ev.fire('state', 'loading');
+        syncTimer = timers.setTimeout(go, wait);
+      } else go();
+      return true;
+    };
 
     function armEnd(my) {
       if (endTimer != null) timers.clearTimeout(endTimer);
@@ -440,11 +611,12 @@
     e.stop = function () {
       var was = e.playing;
       var wasRunning = running;
+      var waiting = syncTimer != null; // playSynced before its start time
       var pos = estimate();
       token++;
       clearTimers();
       running = false;
-      if (!was) return;
+      if (!was) { if (waiting) ev.fire('state', 'stopped'); return; }
       e.playing = false;
       if (wasRunning) {
         lastPos = pos;
@@ -487,16 +659,17 @@
       wire(engine);
     };
     sw.engine = function () { return active; };
-    ['load', 'unload', 'prime', 'playSegment', 'stop', 'positionMs', 'durationMs'].forEach(function (m) {
+    ['load', 'unload', 'prime', 'unlock', 'playSegment', 'playSynced', 'stop', 'positionMs', 'durationMs'].forEach(function (m) {
       sw[m] = function () { return active[m].apply(active, arguments); };
     });
-    ['playing', 'segStartMs', 'segEndMs', 'kind'].forEach(function (p) {
+    ['playing', 'segStartMs', 'segEndMs', 'kind', 'synced'].forEach(function (p) {
       Object.defineProperty(sw, p, { get: function () { return active[p]; }, enumerable: true });
     });
     return sw;
   }
 
   return {
+    SILENT_WAV: SILENT_WAV,
     RANDOM_START_MARGIN_MS: RANDOM_START_MARGIN_MS,
     DEFAULT_CLIP_TOTAL_MS: DEFAULT_CLIP_TOTAL_MS,
     randomFullStartMs: randomFullStartMs,

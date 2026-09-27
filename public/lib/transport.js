@@ -13,14 +13,26 @@
  *                                    hidden or frozen); the host re-registers the room
  *                                    with the signaling server if needed
  *   t.close()
+ *   t.diag()                         connection details for the diagnostics panel (sync)
+ *   t.candidates()        -> Promise  { [peerId]: selected ICE candidate pair } (getStats)
  *
  * Rejections and onError carry an Error with a `code`:
  *   'room-not-found'         nobody is hosting that room code
  *   'room-taken'             (host) the room code is already being hosted
  *   'signaling-unreachable'  the PeerJS signaling server can't be reached
+ *   'ice-failed'             the host answered through the signaling server, but no
+ *                            direct (or relayed) path between the two devices worked
+ *                            (ICE failed): NAT, Wi-Fi client isolation, a firewall
  *   'timeout'                the connection couldn't be set up in time
  *   'webrtc-unsupported'     this browser can't do WebRTC data channels
  *   'transport'              anything else
+ *
+ * ICE servers (PeerTransport opts.iceServers, from PEERJS.iceServers in config.js):
+ * standard RTCIceServer entries ({urls, username, credential}), plus entries with
+ * `authSecret` instead of a username: TURN servers with the "TURN REST API" shared
+ * secret scheme (coturn use-auth-secret), whose time-limited username/credential
+ * are made here (resolveIceServers: HMAC-SHA1, no WebCrypto needed, so it also
+ * works on plain-http LAN pages).
  *
  * PeerTransport: WebRTC data channels via PeerJS (public/vendor/peerjs.min.js)
  * and its free public signaling server. The host's peer id is derived from the
@@ -47,6 +59,7 @@
     'room-not-found': 'That room wasn’t found. Check the code, or ask the host to open the room again.',
     'room-taken': 'That room code is already in use.',
     'signaling-unreachable': 'Couldn’t reach the PeerJS signaling server (0.peerjs.com). Check your internet connection and try again in a minute.',
+    'ice-failed': 'Couldn’t open a direct connection between the phones. Try again; if it keeps failing, put both phones on the same Wi-Fi or ask the host to share a hotspot.',
     timeout: 'Connecting to the room timed out. The host may be offline, or this network may block WebRTC (common on corporate and school Wi-Fi).',
     'webrtc-unsupported': 'This browser can’t make peer-to-peer (WebRTC) connections.',
     transport: 'The connection failed.',
@@ -61,6 +74,144 @@
 
   function randomId() {
     return 'p' + Math.random().toString(36).slice(2, 10) + Date.now().toString(36).slice(-4);
+  }
+
+  // ---------- ICE servers (STUN/TURN) ----------
+
+  function utf8Bytes(s) {
+    s = String(s);
+    if (typeof TextEncoder !== 'undefined') return new TextEncoder().encode(s);
+    var bin = unescape(encodeURIComponent(s));
+    var out = new Uint8Array(bin.length);
+    for (var i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+  }
+
+  /** SHA-1 of a byte array (Uint8Array) -> Uint8Array(20). Small and synchronous. */
+  function sha1(bytes) {
+    var ml = bytes.length;
+    var total = ((ml + 8) >> 6) + 1 << 6;
+    var buf = new Uint8Array(total);
+    buf.set(bytes);
+    buf[ml] = 0x80;
+    var bits = ml * 8;
+    var hi = Math.floor(bits / 0x100000000);
+    var lo = bits >>> 0;
+    buf[total - 8] = hi >>> 24; buf[total - 7] = (hi >>> 16) & 255; buf[total - 6] = (hi >>> 8) & 255; buf[total - 5] = hi & 255;
+    buf[total - 4] = lo >>> 24; buf[total - 3] = (lo >>> 16) & 255; buf[total - 2] = (lo >>> 8) & 255; buf[total - 1] = lo & 255;
+    var h = [0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0];
+    var w = new Array(80);
+    for (var off = 0; off < total; off += 64) {
+      var i;
+      for (i = 0; i < 16; i++) w[i] = (buf[off + 4 * i] << 24) | (buf[off + 4 * i + 1] << 16) | (buf[off + 4 * i + 2] << 8) | buf[off + 4 * i + 3];
+      for (i = 16; i < 80; i++) { var x = w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]; w[i] = (x << 1) | (x >>> 31); }
+      var a = h[0], b = h[1], c = h[2], d = h[3], e = h[4];
+      for (i = 0; i < 80; i++) {
+        var f, k;
+        if (i < 20) { f = (b & c) | (~b & d); k = 0x5A827999; }
+        else if (i < 40) { f = b ^ c ^ d; k = 0x6ED9EBA1; }
+        else if (i < 60) { f = (b & c) | (b & d) | (c & d); k = 0x8F1BBCDC; }
+        else { f = b ^ c ^ d; k = 0xCA62C1D6; }
+        var t = (((a << 5) | (a >>> 27)) + f + e + k + w[i]) | 0;
+        e = d; d = c; c = (b << 30) | (b >>> 2); b = a; a = t;
+      }
+      h[0] = (h[0] + a) | 0; h[1] = (h[1] + b) | 0; h[2] = (h[2] + c) | 0; h[3] = (h[3] + d) | 0; h[4] = (h[4] + e) | 0;
+    }
+    var out = new Uint8Array(20);
+    for (var j = 0; j < 5; j++) { out[4 * j] = h[j] >>> 24; out[4 * j + 1] = (h[j] >>> 16) & 255; out[4 * j + 2] = (h[j] >>> 8) & 255; out[4 * j + 3] = h[j] & 255; }
+    return out;
+  }
+
+  function hmacSha1(key, msg) {
+    var k = utf8Bytes(key);
+    if (k.length > 64) k = sha1(k);
+    var m = utf8Bytes(msg);
+    var inner = new Uint8Array(64 + m.length);
+    var outer = new Uint8Array(64 + 20);
+    for (var i = 0; i < 64; i++) { var kb = i < k.length ? k[i] : 0; inner[i] = kb ^ 0x36; outer[i] = kb ^ 0x5c; }
+    inner.set(m, 64);
+    outer.set(sha1(inner), 64);
+    return sha1(outer);
+  }
+
+  function base64(bytes) {
+    var bin = '';
+    for (var i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+    return typeof btoa === 'function' ? btoa(bin) : Buffer.from(bin, 'binary').toString('base64');
+  }
+
+  /**
+   * RTCIceServer list for RTCPeerConnection: entries with `authSecret` get a
+   * TURN REST API username ("<expiry unix seconds>:<user>", valid for
+   * authTtlSeconds, default 24 h) and credential (base64 HMAC-SHA1 of the
+   * username with the shared secret); other entries are passed through.
+   */
+  function resolveIceServers(list, nowMs) {
+    if (!Array.isArray(list)) return null;
+    var t = nowMs == null ? Date.now() : nowMs;
+    return list.filter(function (s) { return s && s.urls; }).map(function (s) {
+      var out = { urls: Array.isArray(s.urls) ? s.urls.slice() : s.urls };
+      if (s.authSecret) {
+        var user = Math.floor(t / 1000) + (Number(s.authTtlSeconds) > 0 ? Math.floor(s.authTtlSeconds) : 86400) + ':' + (s.authUser || 'gts');
+        out.username = user;
+        out.credential = base64(hmacSha1(s.authSecret, user));
+      } else {
+        if (s.username != null) out.username = s.username;
+        if (s.credential != null) out.credential = s.credential;
+      }
+      return out;
+    });
+  }
+
+  function urlsOf(list) {
+    var out = [];
+    (list || []).forEach(function (s) { if (s && s.urls) out = out.concat(s.urls); });
+    return out;
+  }
+
+  /** Does the list have at least one TURN relay? */
+  function hasTurn(list) {
+    return urlsOf(list).some(function (u) { return /^turns?:/i.test(String(u)); });
+  }
+
+  /**
+   * The ICE candidate pair a connection uses, from RTCPeerConnection.getStats():
+   * { local: 'host'|'srflx'|'prflx'|'relay', remote, protocol, relayProtocol }, or null.
+   */
+  function selectedPair(pc) {
+    if (!pc || typeof pc.getStats !== 'function') return Promise.resolve(null);
+    return Promise.resolve(pc.getStats()).then(function (stats) {
+      var byId = {};
+      var pairId = null;
+      var fallback = null;
+      stats.forEach(function (r) {
+        byId[r.id] = r;
+        if (r.type === 'transport' && r.selectedCandidatePairId) pairId = r.selectedCandidatePairId;
+        if (r.type === 'candidate-pair' && (r.selected || (r.nominated && r.state === 'succeeded')) && !fallback) fallback = r.id;
+      });
+      var pair = byId[pairId || fallback];
+      if (!pair) return null;
+      var l = byId[pair.localCandidateId] || {};
+      var rc = byId[pair.remoteCandidateId] || {};
+      return {
+        local: l.candidateType || '?',
+        remote: rc.candidateType || '?',
+        protocol: l.protocol || rc.protocol || '',
+        relayProtocol: l.relayProtocol || '',
+        rttMs: pair.currentRoundTripTime != null ? Math.round(pair.currentRoundTripTime * 1000) : null,
+      };
+    }, function () { return null; });
+  }
+
+  function connDiag(conn) {
+    var pc = conn && conn.peerConnection;
+    var dc = conn && conn.dataChannel;
+    return {
+      peer: conn ? conn.peer : null,
+      dataChannel: dc && dc.readyState ? dc.readyState : conn && conn.open ? 'open' : 'none',
+      ice: pc ? pc.iceConnectionState : 'none',
+      pc: pc && pc.connectionState ? pc.connectionState : pc ? '' : 'none',
+    };
   }
 
   /**
@@ -157,6 +308,8 @@
     var role = null; // 'host' | 'player'
     var peers = {}; // host: connected player ids
     var closed = false;
+    var localHostId = null; // player: the host tab's id once it accepted
+    var lastError = null;
 
     function post(k, to, d) {
       if (!channel || closed) return;
@@ -198,7 +351,8 @@
           if (taken) {
             channel.close();
             channel = null;
-            reject(transportError('room-taken'));
+            lastError = transportError('room-taken');
+            reject(lastError);
             return;
           }
           channel.onmessage = function (ev) {
@@ -237,6 +391,7 @@
             if (env.k === 'acc' && !accepted) {
               accepted = true;
               hostId = env.from;
+              localHostId = hostId;
               b.seen('host');
               b.startKeepAlive(function () { post('ka', hostId); }, function () { hostId = null; b.emit('leave', 'host'); });
               b.setStatus('connected');
@@ -252,7 +407,7 @@
         var tries = 0;
         (function knock() {
           if (accepted || closed) return;
-          if (tries++ >= 3) { reject(transportError('room-not-found')); return; }
+          if (tries++ >= 3) { lastError = transportError('room-not-found'); reject(lastError); return; }
           post('conn');
           setTimeout(knock, opts.connectMs || 500);
         })();
@@ -283,6 +438,24 @@
       peers = {};
     };
 
+    api.diag = function () {
+      return {
+        kind: 'local',
+        role: role,
+        peerId: id,
+        hostPeerId: role === 'host' ? id : localHostId,
+        signaling: closed ? 'closed' : channel ? 'open (BroadcastChannel)' : 'none',
+        turn: false,
+        iceServers: [],
+        policy: 'n/a',
+        lastError: lastError ? { code: lastError.code, message: lastError.message } : null,
+        conns: role === 'host'
+          ? Object.keys(peers).map(function (p) { return { peer: p, dataChannel: 'open', ice: 'n/a', pc: 'n/a' }; })
+          : role === 'player' ? [{ peer: localHostId || 'host', dataChannel: localHostId ? 'open' : 'connecting', ice: 'n/a', pc: 'n/a' }] : [],
+      };
+    };
+    api.candidates = function () { return Promise.resolve({}); };
+
     api.kind = 'local';
     return api;
   }
@@ -302,7 +475,12 @@
 
   /**
    * @param {object} [opts] { Peer (constructor, default window.Peer), peerOptions
-   *   (host/port/path/key/config for your own PeerServer or TURN), connectTimeoutMs,
+   *   (host/port/path/key/config for your own PeerServer or TURN),
+   *   iceServers (RTCIceServer list, entries may use authSecret, see resolveIceServers;
+   *   default: peerOptions.config.iceServers, else PeerJS's own), iceTransportPolicy
+   *   ('all' | 'relay': only TURN relays, default 'all'), iceCandidatePoolSize,
+   *   debug (PeerJS log level 0-3), iceDisconnectGraceMs (a join whose ICE state is
+   *   'disconnected' this long counts as failed, 4000), connectTimeoutMs,
    *   keepAliveMs, timeoutMs, isHidden, now,
    *   signalingRetryMs (first delay before reconnecting to the signaling server, 500),
    *   signalingRetryMaxMs (backoff cap, 15000), reopenTimeoutMs (how long a
@@ -332,6 +510,19 @@
     var closed = false;
     var connectTimeout = opts.connectTimeoutMs || 15000;
     var peerOptions = Object.assign({ debug: 0 }, opts.peerOptions || {});
+    if (opts.debug != null) peerOptions.debug = Math.max(0, Math.min(3, Number(opts.debug) || 0));
+    var iceSource = opts.iceServers || (peerOptions.config && peerOptions.config.iceServers) || null;
+    var icePolicy = opts.iceTransportPolicy === 'relay' ? 'relay' : 'all';
+    var iceGrace = opts.iceDisconnectGraceMs == null ? 4000 : opts.iceDisconnectGraceMs;
+    var iceList = null; // the servers the last Peer was given (credentials resolved)
+    var role = null;
+    var targetId = null; // player: the host's peer id
+    var pendingConn = null; // player: the connection being set up
+    var pending = {}; // host: connections that haven't opened yet
+    var iceFailures = 0;
+    var lastError = null;
+    var failedConn = null; // player: the connection's state when the join failed (the Peer is destroyed then)
+    var lastPeerId = null;
     var retryBase = opts.signalingRetryMs || 500;
     var retryMax = opts.signalingRetryMaxMs || 15000;
     var reopenTimeout = opts.reopenTimeoutMs || 10000;
@@ -350,10 +541,42 @@
     // (otherwise it answers 'unavailable-id' until the old one times out).
     var hostToken = peerOptions.token || Math.random().toString(36).slice(2);
 
+    /** PeerJS options with the ICE config: { config: { iceServers, iceTransportPolicy } }. */
+    function optionsForPeer() {
+      var o = Object.assign({}, peerOptions);
+      if (iceSource || icePolicy !== 'all' || opts.iceCandidatePoolSize != null) {
+        var cfg = Object.assign({}, peerOptions.config || {});
+        if (iceSource) cfg.iceServers = iceList = resolveIceServers(iceSource, Date.now());
+        cfg.iceTransportPolicy = icePolicy;
+        if (opts.iceCandidatePoolSize != null) cfg.iceCandidatePoolSize = opts.iceCandidatePoolSize;
+        o.config = cfg;
+      }
+      return o;
+    }
+
     function makePeer(id) {
       if (!PeerCtor) throw transportError('transport', 'The PeerJS library didn’t load (vendor/peerjs.min.js).');
       if (typeof RTCPeerConnection === 'undefined') throw transportError('webrtc-unsupported');
-      return id ? new PeerCtor(id, Object.assign({}, peerOptions, { token: hostToken })) : new PeerCtor(peerOptions);
+      var o = optionsForPeer();
+      return id ? new PeerCtor(id, Object.assign(o, { token: hostToken })) : new PeerCtor(o);
+    }
+
+    /**
+     * Call fn(state) on each new ICE connection state of a DataConnection: from
+     * its RTCPeerConnection (conn.peerConnection, created by PeerJS right away)
+     * and PeerJS's own 'iceStateChanged' event.
+     */
+    function watchIce(conn, fn) {
+      var last = null;
+      function check(state) {
+        state = state || (conn.peerConnection && conn.peerConnection.iceConnectionState);
+        if (!state || state === last) return;
+        last = state;
+        fn(state);
+      }
+      if (conn.on) conn.on('iceStateChanged', check);
+      var pc = conn.peerConnection;
+      if (pc && pc.addEventListener) pc.addEventListener('iceconnectionstatechange', function () { check(pc.iceConnectionState); });
     }
 
     // A player's signaling socket can drop too; its data connection keeps working.
@@ -480,7 +703,19 @@
 
     function onHostConnection(conn) {
       var pid = conn.peer;
+      pending[pid] = conn;
+      var reported = false;
+      watchIce(conn, function (state) {
+        if (state !== 'failed' || reported || closed) return;
+        reported = true;
+        if (conns[pid] === conn) return; // an open connection that broke: wire() handles it
+        iceFailures++;
+        lastError = transportError('ice-failed', 'A phone tried to join, but no connection path to this device worked (ICE failed). It keeps trying; if it keeps failing, put both on the same Wi-Fi or share a hotspot.');
+        b.emit('error', lastError);
+      });
+      conn.on('close', function () { if (pending[pid] === conn) delete pending[pid]; });
       conn.on('open', function () {
+        if (pending[pid] === conn) delete pending[pid];
         var old = conns[pid];
         conns[pid] = conn;
         b.seen(pid);
@@ -523,6 +758,7 @@
       p.on('error', function (err) {
         if (closed || p !== peer) return;
         var e = mapPeerError(err);
+        if (e.code !== 'room-not-found') lastError = e;
         if (first && !first.settled) {
           first.settled = true;
           clearTimeout(first.timer);
@@ -545,16 +781,18 @@
 
     api.host = function (roomId) {
       hostId = PEER_PREFIX + roomId;
+      role = 'host';
       return new Promise(function (resolve, reject) {
         var first = { resolve: resolve, reject: reject, settled: false, timer: null };
         var p;
-        try { p = makePeer(hostId); } catch (e) { reject(e); return; }
+        try { p = makePeer(hostId); } catch (e) { lastError = e; reject(e); return; }
         peer = p;
         first.timer = setTimeout(function () {
           if (first.settled) return;
           first.settled = true;
           peer = null;
-          reject(transportError('signaling-unreachable'));
+          lastError = transportError('signaling-unreachable');
+          reject(lastError);
           try { p.destroy(); } catch (e) { /* ignore */ }
         }, connectTimeout);
         attachHostPeer(p, first);
@@ -581,31 +819,69 @@
       ensureSignaling();
     };
 
+    /**
+     * Join: the signaling server introduces this phone to the host, then the
+     * data channel has to open over some ICE path. When the host answered (its
+     * SDP arrived) but no path worked, the join fails with 'ice-failed' (ICE
+     * state 'failed', or 'disconnected' for iceDisconnectGraceMs, or still
+     * checking at the timeout), not with 'timeout' / 'room-not-found'.
+     */
     api.connect = function (roomId) {
+      role = 'player';
+      targetId = PEER_PREFIX + roomId;
       return new Promise(function (resolve, reject) {
         var settled = false;
+        var conn = null;
+        var iceTimer = null;
         function failWith(e) {
           if (settled) return;
           settled = true;
           clearTimeout(timer);
+          clearTimeout(iceTimer);
+          lastError = e;
+          if (e.code === 'ice-failed') iceFailures++;
+          if (conn) failedConn = connDiag(conn);
           try { peer.destroy(); } catch (x) { /* ignore */ }
           reject(e);
         }
-        try { peer = makePeer(null); } catch (e) { reject(e); return; }
-        var timer = setTimeout(function () { failWith(transportError(peer && peer.open ? 'timeout' : 'signaling-unreachable')); }, connectTimeout);
+        try { peer = makePeer(null); } catch (e) { lastError = e; reject(e); return; }
+        var timer = setTimeout(function () {
+          var pc = conn && conn.peerConnection;
+          var answered = !!(pc && pc.remoteDescription);
+          failWith(transportError(!(peer && peer.open) ? 'signaling-unreachable' : answered ? 'ice-failed' : 'timeout'));
+        }, connectTimeout);
         peer.on('error', function (err) {
           var e = mapPeerError(err);
           if (!settled) { failWith(e); return; }
+          lastError = e;
           b.emit('error', e);
         });
         peer.on('open', function () {
           if (settled) return;
+          lastPeerId = peer.id;
           keepSignaling(peer);
-          var conn = peer.connect(PEER_PREFIX + roomId, { reliable: true, serialization: 'json' });
+          conn = peer.connect(targetId, { reliable: true, serialization: 'json' });
+          pendingConn = conn;
+          watchIce(conn, function (state) {
+            if (settled) return;
+            if (state === 'failed') failWith(transportError('ice-failed'));
+            else if (state === 'disconnected') {
+              clearTimeout(iceTimer);
+              iceTimer = setTimeout(function () {
+                var st = conn.peerConnection && conn.peerConnection.iceConnectionState;
+                if (st !== 'connected' && st !== 'completed') failWith(transportError('ice-failed'));
+              }, iceGrace);
+            } else if (state === 'connected' || state === 'completed') clearTimeout(iceTimer);
+          });
+          // PeerJS reports a failed ICE negotiation as a connection error.
+          conn.on('error', function (err) {
+            if (!settled && err && err.type === 'negotiation-failed') failWith(transportError('ice-failed', null, err));
+          });
           conn.on('open', function () {
             if (settled) { try { conn.close(); } catch (e) { /* ignore */ } return; }
             settled = true;
             clearTimeout(timer);
+            clearTimeout(iceTimer);
             hostConn = conn;
             b.seen('host');
             wire(conn, 'host', function () {
@@ -632,6 +908,43 @@
     api.send = function (to, msg) {
       var c = to === 'host' ? hostConn : conns[to];
       if (c && c.open) c.send(msg);
+    };
+
+    api.diag = function () {
+      var list = [];
+      if (role === 'player') {
+        var c = hostConn || pendingConn;
+        if (!hostConn && failedConn) list.push(failedConn);
+        else if (c) list.push(connDiag(c));
+      } else {
+        Object.keys(conns).forEach(function (k) { list.push(connDiag(conns[k])); });
+        Object.keys(pending).forEach(function (k) { if (conns[k] !== pending[k]) list.push(Object.assign(connDiag(pending[k]), { pending: true })); });
+      }
+      var urls = urlsOf(iceList || iceSource);
+      return {
+        kind: 'peer',
+        role: role,
+        peerId: (peer && peer.id) || lastPeerId,
+        hostPeerId: role === 'host' ? hostId : targetId,
+        signaling: !peer ? 'none' : peer.destroyed ? 'destroyed' : peer.disconnected ? 'disconnected' : peer.open ? 'open' : 'connecting',
+        server: peerOptions.host || '0.peerjs.com',
+        turn: hasTurn(iceList || iceSource),
+        iceServers: urls,
+        policy: icePolicy,
+        iceFailures: iceFailures,
+        lastError: lastError ? { code: lastError.code, message: lastError.message } : null,
+        conns: list,
+      };
+    };
+
+    /** The selected ICE candidate pair of each connection (host: per phone; player: 'host'). */
+    api.candidates = function () {
+      var out = {};
+      var list = role === 'player' ? [['host', hostConn || pendingConn]] : Object.keys(conns).map(function (k) { return [k, conns[k]]; });
+      return Promise.all(list.map(function (x) {
+        if (!x[1] || !x[1].peerConnection) return null;
+        return selectedPair(x[1].peerConnection).then(function (p) { out[x[0]] = p; });
+      })).then(function () { return out; });
     };
 
     api.close = function () {
@@ -666,6 +979,10 @@
     PeerTransport: PeerTransport,
     kindFromSearch: kindFromSearch,
     transportError: transportError,
+    resolveIceServers: resolveIceServers,
+    hasTurn: hasTurn,
+    selectedPair: selectedPair,
+    hmacSha1Base64: function (key, msg) { return base64(hmacSha1(key, msg)); },
     MESSAGES: MESSAGES,
     PEER_PREFIX: PEER_PREFIX,
   };

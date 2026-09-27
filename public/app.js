@@ -45,6 +45,22 @@
   var Transport = window.Transport;
   // ?transport=local: rooms between tabs of this browser (BroadcastChannel) instead of PeerJS.
   var TRANSPORT_KIND = Transport.kindFromSearch(window.location.search);
+  // ?debug=1..3: PeerJS log level (and the "Connection details" panel starts open).
+  var DEBUG_LEVEL = (function () {
+    var m = /[?&]debug(?:=(\d))?(?:&|#|$)/.exec(window.location.search);
+    return m ? Math.max(1, Math.min(3, parseInt(m[1] || '1', 10) || 1)) : 0;
+  })();
+  // ?ice=relay: connect through TURN relays only (testing a relay, or a network that needs one).
+  var ICE_RELAY = /[?&]ice=relay(?:&|#|$)/i.test(window.location.search);
+  var LOCAL_SOUND_ON = 'gts:sound-on'; // "Sound plays on": 'all' | 'host'
+
+  /**
+   * One clock for room sync on every device: milliseconds since the epoch, but
+   * monotonic (performance.now()), so it doesn't jump when the system clock is
+   * adjusted. Phones measure their offset to the host's with ping/pong.
+   */
+  var perfBase = window.performance && performance.now && performance.timeOrigin ? performance.timeOrigin : null;
+  function clockNow() { return perfBase != null ? perfBase + performance.now() : Date.now(); }
 
   // Clip lengths: the first clip, and the extension unlocked by "play next ...
   // seconds" (0: none). They are chosen on the setup screen and stored in the
@@ -198,6 +214,108 @@
     currentScreen = name;
     renderRoomChip();
     renderNetStatus();
+    // Rooms: "Connection details" on the join, lobby, host and player screens.
+    $('diag').hidden = !(hosting || joined || name === 'join');
+    if (!$('diag').hidden && $('diag').open) refreshDiag();
+  }
+
+  // ---------- Connection details (diagnostics panel) ----------
+
+  function fmtTime(t) { return t ? new Date(t).toISOString().slice(11, 23) + ' UTC' : '–'; }
+  function fmtErr(e) { return e && e.code ? e.code + (e.message ? ' — ' + e.message : '') + (e.at ? ' (' + fmtTime(e.at) + ')' : '') : 'none'; }
+  function fmtPair(p) {
+    if (TRANSPORT_KIND === 'local') return 'n/a (same browser)';
+    if (!p) return 'not selected yet';
+    return p.local + ' ↔ ' + p.remote + (p.protocol ? ' over ' + p.protocol : '') + (p.relayProtocol ? ' (relay via ' + p.relayProtocol + ')' : '') +
+      (p.rttMs != null ? ', ' + p.rttMs + ' ms round trip' : '');
+  }
+
+  /** The panel's text: transport, signaling, ids, last error, data channel, ICE, candidate pair, TURN, retries, times. */
+  function diagText() {
+    var lines = [];
+    var add = function (k, v) { lines.push(k + ': ' + (v == null || v === '' ? '–' : v)); };
+    var cfg = transportOptions();
+    var h = hosting;
+    var j = joined;
+    var t = h ? h.transport : j ? j.ctl.transport() : null;
+    var info = j ? j.ctl.info() : null;
+    var d = null;
+    try { d = h ? (t && t.diag ? t.diag() : null) : info ? info.transport : null; } catch (e) { d = null; }
+    add('Time', new Date().toISOString());
+    add('Transport', TRANSPORT_KIND === 'local' ? 'local (BroadcastChannel, tabs of this browser)' : 'peer (PeerJS / WebRTC)');
+    add('Role', h ? 'host of room ' + h.room.code : j ? 'player "' + j.name + '" in room ' + j.code : 'not in a room');
+    if (h) add('Room status', h.status + ' · signaling ' + (h.net || '–') + ' · pill ' + (hostNetState() || '–'));
+    if (j) add('Player status', j.status + (j.detail && j.detail.code ? ' (' + j.detail.code + ')' : ''));
+    add('Signaling', d ? d.signaling + (d.server ? ' (' + d.server + ')' : '') : TRANSPORT_KIND === 'local' ? 'BroadcastChannel' : 'not started');
+    add('Own peer id', d && d.peerId);
+    add('Host peer id', d && d.hostPeerId ? d.hostPeerId : j ? Room.peerIdFor(j.code) : h ? Room.peerIdFor(h.room.code) : null);
+    add('Last error', fmtErr(h ? h.lastError || (h.netError ? { code: h.netError.code, message: h.netError.message } : null) || (d && d.lastError) : info ? info.lastError || (d && d.lastError) : null));
+    var ice = cfg.iceServers || [];
+    add('TURN configured', TRANSPORT_KIND === 'local' ? 'n/a' : (Transport.hasTurn(ice) ? 'yes' : 'no') + ' (' + ice.length + ' ICE server entries; policy ' +
+      (d && d.policy ? d.policy : cfg.iceTransportPolicy) + ')');
+    if (h) {
+      add('Retries', 'room open attempts ' + (h.attempts || 0) + ', ICE failures of joining phones ' + (d && d.iceFailures || 0));
+      add('Times', 'opened ' + fmtTime(h.openedAt) + (h.connectingSince ? ', connecting since ' + fmtTime(h.connectingSince) : ''));
+      var byPeer = {};
+      h.room.players.forEach(function (p) { if (p.peerId) byPeer[p.peerId] = p; });
+      add('Sound', (Room.soundEverywhere(h.room) ? 'every device' : 'host only') + ' · ' + h.room.settings.engine);
+      var conns = d && d.conns ? d.conns : [];
+      if (!conns.length) add('Phones', 'none connected');
+      conns.forEach(function (c) {
+        var p = byPeer[c.peer];
+        add('Phone ' + (p ? p.name : c.peer) + (c.pending ? ' (joining)' : ''),
+          'data channel ' + c.dataChannel + ', ICE ' + c.ice + ', path ' + fmtPair(diagPairs[c.peer]) +
+          (p ? ', clock offset ' + (p.clockOffset != null ? p.clockOffset + ' ms' : '?') + ', rtt ' + (p.rtt != null ? p.rtt + ' ms' : '?') + (p.spotifyReady ? ', Spotify ready' : '') : ''));
+      });
+    } else if (j) {
+      var c0 = d && d.conns && d.conns[0];
+      add('Data channel', c0 ? c0.dataChannel : '–');
+      add('ICE connection', c0 ? c0.ice + (c0.pc ? ' (peer connection ' + c0.pc + ')' : '') : '–');
+      add('Candidate pair', fmtPair(diagPairs.host));
+      add('Retries', 'attempts ' + info.attempts + ', ICE failures ' + info.iceFailures + (info.relay ? ', next/current attempt relay-only' : ''));
+      add('Times', 'join started ' + fmtTime(info.joinStartedAt) + ', last attempt ' + fmtTime(info.lastAttemptAt) + ', connected ' + fmtTime(info.connectedAt));
+      add('Clock', info.clock ? 'offset to host ' + info.clock.offset + ' ms, round trip ' + info.clock.rtt + ' ms' : 'not measured yet');
+      add('Sound', phoneSoundMode() + (previewEngine.unlocked ? ', unlocked' : ', not unlocked yet') + (j.soundBlocked ? ', BLOCKED' : '') +
+        (phoneSoundMode() === 'spotify' ? ', Spotify ' + (phoneSpotifyReady() ? 'ready' : 'not ready') : ''));
+    }
+    add('Browser', navigator.userAgent);
+    return lines.join('\n');
+  }
+
+  var diagPairs = {};
+  var diagTimer = null;
+  var diagBusy = false;
+  /** Refresh the panel (and the selected candidate pairs, from getStats) while it's open. */
+  function refreshDiag() {
+    clearTimeout(diagTimer);
+    diagTimer = null;
+    var box = $('diag');
+    if (box.hidden || !box.open) return;
+    try { $('diag-text').textContent = diagText(); } catch (e) { $('diag-text').textContent = 'Couldn’t read the connection details: ' + e.message; }
+    var t = hosting ? hosting.transport : joined ? joined.ctl.transport() : null;
+    if (t && t.candidates && !diagBusy) {
+      diagBusy = true;
+      t.candidates().then(function (pairs) { diagPairs = pairs || {}; }, function () { /* keep the last */ })
+        .then(function () { diagBusy = false; });
+    }
+    diagTimer = setTimeout(refreshDiag, 1000);
+  }
+
+  function onDiagCopy() {
+    var text = diagText();
+    var done = function () { toast('Connection details copied.'); };
+    var fallback = function () {
+      var r = document.createRange();
+      r.selectNodeContents($('diag-text'));
+      var s = window.getSelection();
+      s.removeAllRanges();
+      s.addRange(r);
+      var ok = false;
+      try { ok = document.execCommand('copy'); } catch (e) { ok = false; }
+      if (ok) done(); else toast('Couldn’t copy. Select the text and copy it by hand.');
+    };
+    if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(text).then(done, fallback);
+    else fallback();
   }
 
   /** "Room ABCD" in the header while hosting a started game or playing in a room. */
@@ -279,22 +397,37 @@
     return off * 1000;
   }
   /** The current clip's offset in seconds (for clip-relative progress). */
-  function clipOffset() { return clipOffsetMs(player.durationMs()) / 1000; }
+  function clipOffset() {
+    // A clip played on every device: the offset it was sent with.
+    if (turnUi.syncOffMs != null) return turnUi.syncOffMs / 1000;
+    return clipOffsetMs(player.durationMs()) / 1000;
+  }
 
+  // `player` events drive the host / pass-the-phone screens. A phone in a room
+  // plays through the engines directly (see "Sound on this phone" below).
   player.onProgress(function (ms) {
     // Result-screen playback: a phone's Next can stop it after the next turn began.
-    if (!game || game.phase !== 'round' || resultMode === 'listen') return;
+    if (joined || !game || game.phase !== 'round' || resultMode === 'listen') return;
     renderProgress(ms / 1000 - clipOffset());
     if (player.playing) reportPlayback('playing');
   });
   player.onState(function (s) {
+    if (joined) return;
     var listening = resultMode === 'listen'; // onPlayerState clears it on 'stopped'
     onPlayerState(s);
     if (!listening) reportPlayback(s);
   });
   player.onError(function (msg, err) {
+    if (joined) return;
     var code = err && err.code;
     if (code === 'premium') { fallbackToPreviews(msg); return; }
+    if (code === 'blocked' && hosting && lastSync && soundEverywhere() && game && game.phase === 'round') {
+      // The phones play the clip anyway; this screen keeps the clip's time (and
+      // unlocks "play next") without sound until someone taps it.
+      startGhost(lastSync);
+      showNotice('This screen’s browser blocked the sound; the phones still play it. Tap play here to hear it on this device too.');
+      return;
+    }
     if (code === 'signed-out') {
       // The banner (with "Sign in again") says it; the phones hear why nothing plays.
       showAuthBanner();
@@ -418,7 +551,7 @@
   function renderDevices() {
     var selId = spCtl.deviceId();
     var sel = spCtl.selectedDevice();
-    ['sp-device', 'round-device-select'].forEach(function (id) {
+    ['sp-device', 'round-device-select', 'p-sp-device'].forEach(function (id) {
       var box = $(id);
       box.textContent = '';
       var list = spDevices.slice();
@@ -434,8 +567,10 @@
     var hint = info.status === 'loading' ? 'Starting the player in this browser…'
       : info.status === 'failed' ? info.error + ' Open Spotify on your phone or computer, then Refresh and pick it.'
       : !spDevices.length && !spDevicesLoading ? 'Open Spotify on your phone, computer or speaker, then tap Refresh.'
-      : 'The songs play on this device. Only the host needs Spotify.';
+      : 'The songs play on this device. Players can also sign in on their phones to hear full songs there.';
     $('sp-device-hint').textContent = hint;
+    // A phone in a room: tell the host whether it can play full songs now.
+    if (joined) reportSpotifyReady();
   }
 
   function onDevicePicked(e) {
@@ -489,6 +624,7 @@
     local.remove(LOCAL_SP_NAME);
     spDevices = [];
     spReadyStarted = false;
+    if (joined) reportSpotifyReady(); // the host stops sending this phone the song's URI
     soundStatus('Signed out of Spotify.');
     renderSound();
   }
@@ -496,7 +632,7 @@
   /** Spotify redirected back here with ?code=: finish signing in. */
   function finishSignIn(r) {
     spAuth.completeSignIn(r).then(function () {
-      setSoundPref('spotify');
+      if (!joined) setSoundPref('spotify'); // a phone signed in to hear full songs; its own setup keeps its choice
       hideAuthBanner();
       toast('Signed in to Spotify.');
       if (currentScreen === 'setup') renderSound();
@@ -587,7 +723,7 @@
       var before = g.queue.length;
       g.queue = g.queue.filter(function (id) { return playable[id]; });
       saveGame();
-      if (hosting) hosting.ctl.broadcast();
+      if (hosting) { hosting.ctl.broadcast(); hosting.ctl.preload(); }
       var dropped = before - g.queue.length;
       var extra = dropped ? ' ' + dropped + ' song' + (dropped === 1 ? '' : 's') + ' without a preview were taken out.' : '';
       if (inRound()) {
@@ -680,7 +816,15 @@
       clipStart: clipStartInput ? clipStartInput.value : 'beginning',
       clip: readClipSetting(),
       engine: soundPref(),
+      soundOn: soundOnPref(),
     };
+  }
+
+  /** "Sound plays on" (rooms): 'all' (every player's device, the default) or 'host'. */
+  function soundOnPref() {
+    var r = document.querySelector('input[name="sound-on"]:checked');
+    if (r) return r.value === 'host' ? 'host' : 'all';
+    return local.get(LOCAL_SOUND_ON) === 'host' ? 'host' : 'all';
   }
 
   /** The clip lengths chosen on the setup screen ({ firstMs, extendMs }). */
@@ -716,6 +860,9 @@
     if (s.rounds != null && sel.querySelector('option[value="' + s.rounds + '"]')) sel.value = String(s.rounds);
     var c = document.querySelector('input[name="clip-start"][value="' + (s.clipStart === 'random' ? 'random' : 'beginning') + '"]');
     if (c) c.checked = true;
+    var so = s.soundOn === 'host' || s.soundOn === 'all' ? s.soundOn : local.get(LOCAL_SOUND_ON) === 'host' ? 'host' : 'all';
+    var sr = document.querySelector('input[name="sound-on"][value="' + so + '"]');
+    if (sr) sr.checked = true;
     // Clip lengths (a setup saved before they existed: 5 s, then 10 s more).
     var cl = G.normalizeClip(s.clip);
     [['clip-first', cl.firstMs, G.DEFAULT_CLIP.firstMs], ['clip-extra', cl.extendMs, G.DEFAULT_CLIP.extendMs]].forEach(function (x) {
@@ -1065,6 +1212,7 @@
   function onPlayClick() {
     if (hosting) {
       // Host fallback (or a player on this device): the same actions a phone sends.
+      if (ghost) { resumeHostSound(); return; }
       if (player.playing) { hostAct('stop'); return; }
       reloadAfterError();
       hostAct('play');
@@ -1250,9 +1398,22 @@
   var hosting = null; // { room, ctl, transport, status: 'connecting'|'open'|'retrying'|'error', error, attempts }
   var joined = null; // player side, see below
 
-  function transportOptions() {
-    var cfg = window.GTS_CONFIG || {};
-    return { peerOptions: cfg.PEERJS || undefined };
+  /**
+   * Options for Transport.create: PeerServer settings and ICE servers from
+   * PEERJS in config.js. o.relay (a phone retrying after ICE failed) or
+   * ?ice=relay: TURN relays only.
+   */
+  function transportOptions(o) {
+    var cfg = (window.GTS_CONFIG || {}).PEERJS || {};
+    var server = {};
+    ['host', 'port', 'path', 'key', 'secure', 'pingInterval', 'config'].forEach(function (k) { if (cfg[k] != null) server[k] = cfg[k]; });
+    return {
+      peerOptions: server,
+      iceServers: cfg.iceServers || (cfg.config && cfg.config.iceServers) || null,
+      iceTransportPolicy: ICE_RELAY || (o && o.relay) ? 'relay' : cfg.iceTransportPolicy || 'all',
+      iceCandidatePoolSize: cfg.iceCandidatePoolSize,
+      debug: DEBUG_LEVEL,
+    };
   }
 
   function roomLink(code) {
@@ -1273,6 +1434,7 @@
       settings: {
         mode: songs.mode, rounds: setup.rounds, clipStart: setup.clipStart, clip: setup.clip, sourceUrl: setup.url,
         engine: songs.engine, device: songs.engine === 'spotify' ? spCtl.selectedDevice() : null,
+        soundOn: setup.soundOn,
       },
       source: songs.source,
       tracks: songs.tracks,
@@ -1340,9 +1502,14 @@
     h.status = h.attempts ? 'retrying' : 'connecting';
     h.net = 'idle';
     h.netError = null;
+    // The signaling server should answer within seconds: say so on screen after 10 s.
+    if (!h.connectingSince) h.connectingSince = Date.now();
+    clearTimeout(h.slowTimer);
+    h.slowTimer = setTimeout(function () { if (hosting === h) renderHostConn(); }, 10000 - Math.min(9000, Date.now() - h.connectingSince));
     h.ctl = Room.createHost({
       room: h.room,
       transport: t,
+      clock: clockNow,
       hooks: { onEffect: onRoomEffect, onChange: onRoomChange },
     });
     // Signaling status after the room opened: the transport reconnects on its own.
@@ -1357,6 +1524,7 @@
     t.onError(function (err) {
       if (hosting !== h || h.transport !== t) return;
       if (err.code === 'room-taken') { h.netError = err; renderHostConn(); return; }
+      h.lastError = { code: err.code, message: err.message, at: Date.now() };
       toast(err.message, 6000);
     });
     renderHostConn();
@@ -1365,6 +1533,9 @@
       h.status = 'open';
       h.error = null;
       h.attempts = 0;
+      h.connectingSince = 0;
+      h.openedAt = Date.now();
+      clearTimeout(h.slowTimer);
       renderHostConn();
       h.ctl.broadcast();
     }, function (err) {
@@ -1400,6 +1571,9 @@
       }
       h.status = 'error';
       h.error = err;
+      h.lastError = { code: err.code, message: err.message, at: Date.now() };
+      h.connectingSince = 0;
+      clearTimeout(h.slowTimer);
       renderHostConn();
     });
   }
@@ -1449,6 +1623,8 @@
     var h = hosting;
     if (!h) return null;
     if (navigator.onLine === false || h.status === 'error') return 'offline';
+    // Not registered with the signaling server after 10 s: nobody can join (still retrying).
+    if ((h.status === 'connecting' || h.status === 'retrying') && h.connectingSince && Date.now() - h.connectingSince >= 10000) return 'offline';
     if (h.status === 'connecting') return 'connecting';
     if (h.status === 'retrying') return 'reconnecting';
     if (h.net === 'offline' || h.netError) return 'offline';
@@ -1478,7 +1654,14 @@
     var retry = null;
     var peerNote = TRANSPORT_KIND === 'local' ? ' (same-browser test mode)' : '';
     var net = hostNetState();
-    if (h.status === 'connecting') msg = 'Opening room ' + h.room.code + peerNote + '…';
+    var slow = (h.status === 'connecting' || h.status === 'retrying') && h.connectingSince && Date.now() - h.connectingSince >= 10000;
+    if (slow) {
+      // Nobody can join until the room is registered with the signaling server.
+      msg = 'Still can’t reach the signaling server (' + (TRANSPORT_KIND === 'local' ? 'same-browser test mode' : '0.peerjs.com') +
+        ') after ' + Math.round((Date.now() - h.connectingSince) / 1000) + ' seconds, so players can’t join yet. Check this device’s internet connection. Still trying…';
+      bad = true;
+      retry = function () { h.attempts = 0; h.connectingSince = Date.now(); connectHost(); };
+    } else if (h.status === 'connecting') msg = 'Opening room ' + h.room.code + peerNote + '…';
     else if (h.status === 'retrying') msg = 'Reopening room ' + h.room.code + '… Players will reconnect automatically.';
     else if (h.status === 'error') {
       msg = (h.error && h.error.message ? h.error.message : 'Couldn’t open the room.') + ' Tap “Try again”.';
@@ -1536,7 +1719,8 @@
     $('lobby-source').textContent = '“' + srcName + '” · ' + room.tracks.length + ' songs · ' +
       (s.mode === 'free' ? 'Free answer' : 'Multiple choice') + ' · ' +
       (s.rounds ? s.rounds + ' round' + (s.rounds === 1 ? '' : 's') : 'until the songs run out') + ' · ' +
-      (s.clipStart === 'random' ? 'random spot' : 'from the beginning') + ' · ' + clipSummary(Room.roomClip(room));
+      (s.clipStart === 'random' ? 'random spot' : 'from the beginning') + ' · ' + clipSummary(Room.roomClip(room)) + ' · ' +
+      (Room.soundEverywhere(room) ? (s.engine === 'spotify' ? 'sound on this device and on phones signed in to Spotify' : 'sound on every phone') : 'sound on this device only');
     lobbyError('');
     renderLobbyPlayers();
     renderHostConn();
@@ -1612,10 +1796,138 @@
       reloadAfterError();
       if (effect.extend) renderExtendState();
       turnUi.heard = effect.extend ? clipFirst() : 0;
+      if (soundEverywhere()) { startSyncedPlay(effect); return; }
       player.playSegment(effect.from * 1000, effect.to * 1000, clipOffsetMs);
     } else if (effect.type === 'stop' || effect.type === 'answered' || effect.type === 'over' || effect.type === 'next') {
+      syncReq++;
+      stopGhost();
       player.stop();
     }
+  }
+
+  // ---------- Sound on every device (host side) ----------
+
+  /** Is the hosted room's clip played on every player's device? */
+  function soundEverywhere() { return !!(hosting && Room.soundEverywhere(hosting.room)); }
+
+  var syncReq = 0;
+  var lastSync = null; // the last clip sent to every device (for the host's own catch-up)
+
+  /**
+   * How far ahead a clip is scheduled, so the `play` reaches every phone
+   * before it starts: the slowest phone's round trip plus a margin (at least
+   * 400 ms; full songs 900 ms, as Spotify itself needs time to start).
+   */
+  function syncLeadMs(engine) {
+    var worst = 0;
+    hosting.room.players.forEach(function (p) { if (p.online && !p.local && p.rtt > worst) worst = p.rtt; });
+    var lead = Math.max(engine === 'spotify' ? 900 : 400, 250 + worst);
+    return Math.min(lead, 2000);
+  }
+
+  /**
+   * The clip in ms of the audio file ([startMs, endMs)) with its offset, the
+   * same for every device. Full songs with a random start need the song's
+   * length first (asked from Spotify when the track list didn't have it).
+   */
+  function syncSegment(effect) {
+    var track = currentTrack();
+    var cur = game.current;
+    var spotify = player.kind === 'spotify';
+    var ready = spotify && game.clipStartMode === 'random' && cur.fullStart == null && !(track.durationMs > 0) && spAuth.isSignedIn()
+      ? spApi.getTrack(track.id).then(function (n) {
+        if (n && n.durationMs > 0) track.durationMs = n.durationMs;
+        if (n && n.uri && !track.uri) track.uri = n.uri;
+      }, function () { /* 0 s offset then */ })
+      : spotify ? Promise.resolve() : previewMetadata(2500);
+    return ready.then(function () {
+      var dur = spotify ? (track.durationMs > 0 ? track.durationMs : NaN) : previewEngine.durationMs();
+      // Every play of a song uses the same offset (a short preview can move it once its length is known).
+      var off = turnUi.syncOffMs != null ? turnUi.syncOffMs : clipOffsetMs(dur);
+      var startMs = Math.round(effect.from * 1000 + off);
+      var endMs = Math.round(effect.to * 1000 + off);
+      if (dur > 0) endMs = Math.min(endMs, Math.floor(dur));
+      return {
+        engine: spotify ? 'spotify' : 'preview',
+        startMs: startMs, endMs: endMs, from: effect.from, to: effect.to, extend: !!effect.extend, offMs: off,
+        previewUrl: spotify ? null : track.previewUrl,
+        uri: spotify ? track.uri || 'spotify:track:' + track.id : null,
+        durationMs: track.durationMs > 0 ? track.durationMs : null,
+      };
+    });
+  }
+
+  /**
+   * Resolves once the loaded preview's length is known (the random start is
+   * fitted to it), or after `ms`.
+   */
+  function previewMetadata(ms) {
+    if (previewEngine.durationMs() > 0 || !previewEngine.audio.getAttribute('src')) return Promise.resolve();
+    return new Promise(function (resolve) {
+      var a = previewEngine.audio;
+      var done = function () { a.removeEventListener('loadedmetadata', done); a.removeEventListener('error', done); clearTimeout(t); resolve(); };
+      var t = setTimeout(done, ms);
+      a.addEventListener('loadedmetadata', done);
+      a.addEventListener('error', done);
+    });
+  }
+
+  /** Every device plays the clip: schedule it a moment ahead, tell the phones, play it here too. */
+  function startSyncedPlay(effect) {
+    var g = game;
+    var cur = g.current;
+    var req = ++syncReq;
+    stopGhost();
+    player.stop();
+    syncSegment(effect).then(function (seg) {
+      if (req !== syncReq || !hosting || game !== g || g.current !== cur || cur.answered) return;
+      seg.startAt = clockNow() + syncLeadMs(seg.engine);
+      lastSync = seg;
+      turnUi.syncOffMs = seg.offMs;
+      hosting.ctl.play(seg);
+      player.playSynced(seg.startMs, seg.endMs, seg.startAt, clockNow);
+    });
+  }
+
+  /**
+   * The host's sound is blocked but the phones play: keep the clip's time on
+   * this screen (progress, "stopped" at the end) so the game goes on.
+   */
+  var ghost = null;
+  function startGhost(seg) {
+    stopGhost();
+    var g = game;
+    var tick = function () {
+      if (!hosting || game !== g || !g.current || g.phase !== 'round') { stopGhost(); return; }
+      var pos = seg.from + (clockNow() - seg.startAt) / 1000;
+      if (pos >= seg.to) {
+        stopGhost();
+        renderProgress(seg.to);
+        turnUi.playedOnce = true;
+        hosting.ctl.playback({ status: 'stopped', pos: seg.to, from: 0, to: 0 });
+        onPlayerState('stopped');
+        return;
+      }
+      pos = Math.max(seg.from, pos);
+      renderProgress(pos);
+      hosting.ctl.playback({ status: 'playing', pos: pos, from: seg.from, to: seg.to });
+    };
+    ghost = { seg: seg, timer: setInterval(tick, 200) };
+    tick();
+  }
+  function stopGhost() {
+    if (!ghost) return;
+    clearInterval(ghost.timer);
+    ghost = null;
+  }
+
+  /** "Tap play here to hear it": the tap allows sound; join the clip where the phones are. */
+  function resumeHostSound() {
+    var seg = ghost && ghost.seg;
+    stopGhost();
+    showNotice('');
+    player.unlock();
+    if (seg) player.playSynced(seg.startMs, seg.endMs, seg.startAt, clockNow);
   }
 
   /** The room changed: save it and update the host's screen. */
@@ -1784,6 +2096,7 @@
     var name = Room.cleanName($('join-name').value);
     if (!code) { joinError('Enter the 4-letter room code shown on the host’s screen.'); $('join-code').focus(); return; }
     if (!name) { joinError('Enter your name.'); $('join-name').focus(); return; }
+    unlockAudio(); // inside the tap: clips started by the host later may make sound
     joinRoom(code, name);
   }
 
@@ -1800,7 +2113,11 @@
     store.set(STORE_JOIN, { code: code, name: name });
     setUrlRoom(code);
     var token = local.get(tokenKey(code, name)) || o.token || null;
-    var j = { code: code, name: name, token: token, auto: !!o.auto, ctl: null, view: null, playback: null, status: 'connecting', detail: null, optionsKey: '', pending: false, savedAt: 0 };
+    var j = {
+      code: code, name: name, token: token, auto: !!o.auto, ctl: null, view: null, playback: null, status: 'connecting', detail: null, optionsKey: '', pending: false, savedAt: 0,
+      // Sound on this phone: the last `play` from the host, the clip playing here, the loaded preview.
+      lastPlay: null, localPlay: null, loadedUrl: '', soundKey: '', soundBlocked: false, spDisabled: false,
+    };
     joined = j;
     // Remembered in localStorage (saveJoin) only once the host has let us in:
     // a mistyped code must not be rejoined automatically for 12 hours.
@@ -1808,8 +2125,14 @@
       code: code,
       name: name,
       token: token,
-      makeTransport: function () { return Transport.create(TRANSPORT_KIND, transportOptions()); },
+      clock: clockNow,
+      pingCount: 5,
+      // After a failed ICE negotiation the next attempt asks for TURN relays only.
+      makeTransport: function (a) { return Transport.create(TRANSPORT_KIND, transportOptions(a)); },
       hooks: {
+        onPlay: function (msg) { if (joined === j) onPhonePlay(msg); },
+        onPreload: function (msg) { if (joined === j) onPhonePreload(msg); },
+        onHalt: function () { if (joined === j) { stopPhoneAudio(); renderPlayerPlayback(); } },
         onStatus: function (s, d) {
           if (joined !== j) return;
           j.status = s;
@@ -1824,6 +2147,9 @@
         },
         onState: function (v) {
           if (joined !== j) return;
+          // A new turn (or no turn): whatever this phone was playing is over.
+          var key = v.phase === 'round' && v.turn ? v.turn.song + ':' + v.turn.playerId : v.phase;
+          if (key !== j.soundKey) { j.soundKey = key; j.lastPlay = null; stopPhoneAudio(); }
           j.view = v;
           j.playback = v.playback;
           j.playbackAt = now();
@@ -1838,8 +2164,146 @@
       },
     });
     j.ctl.start();
+    j.ctl.setInfo({ spotifyReady: phoneSpotifyReady() });
     keepAwake(true);
     renderPlayer();
+  }
+
+  // ---------- Sound on this phone ("Sound plays on: every player's device") ----------
+
+  /** 'preview' | 'spotify' (full songs) | 'host' (only the host's device plays). */
+  function phoneSoundMode() {
+    var v = joined && joined.view;
+    if (!v || !v.settings || v.settings.soundOn !== 'all') return 'host';
+    return v.settings.fullSongs ? 'spotify' : 'preview';
+  }
+
+  /** Can this phone play full songs itself (signed in to Spotify, with a device picked)? */
+  function phoneSpotifyReady() {
+    return !!(spAuth.isSignedIn() && spCtl.deviceId() && !(joined && joined.spDisabled));
+  }
+
+  /** Tell the host whether to send this phone the song's URI (full songs). */
+  function reportSpotifyReady() {
+    if (!joined) return;
+    joined.ctl.setInfo({ spotifyReady: phoneSpotifyReady() });
+    renderPhoneSound();
+  }
+
+  /** Inside a tap: allow clips that the host starts later (no tap of their own) to make sound. */
+  function unlockAudio() {
+    try { previewEngine.unlock(); } catch (e) { /* ignore */ }
+    try { spCtl.activate(); } catch (e) { /* ignore */ }
+  }
+
+  function phoneEngine(j) {
+    return j && j.localPlay ? (j.localPlay.engine === 'spotify' ? spotifyEngine : previewEngine) : null;
+  }
+
+  function stopPhoneAudio() {
+    var j = joined;
+    if (j) j.localPlay = null;
+    if (previewEngine.playing) previewEngine.stop();
+    // Always: a full-song clip waiting for its start time (playSynced) isn't `playing` yet.
+    spotifyEngine.stop();
+  }
+
+  /** The host started a turn: load the preview now, so it's ready when Play is tapped. */
+  function onPhonePreload(msg) {
+    var j = joined;
+    if (!msg || msg.engine !== 'preview' || !msg.previewUrl || j.loadedUrl === msg.previewUrl || previewEngine.playing) return;
+    previewEngine.load({ previewUrl: msg.previewUrl });
+    j.loadedUrl = msg.previewUrl;
+  }
+
+  /**
+   * The host started a clip on every device: play [startMs, endMs) here at the
+   * host's startAt (converted with this phone's clock offset), or show that
+   * the host's device plays it (full songs without Spotify on this phone).
+   */
+  function onPhonePlay(msg) {
+    var j = joined;
+    var ci = j.ctl.clockInfo();
+    var off = ci ? ci.offset : msg.offset != null ? msg.offset : 0;
+    var p = Object.assign({}, msg, { localAt: msg.startAt - off });
+    // The same clip again (re-sent after a reconnect) while it still plays here: keep going.
+    var cur = j.localPlay && j.localPlay.msg;
+    if (cur && cur.seq === msg.seq && cur.startAt === msg.startAt && localBusy(j)) return;
+    stopPhoneAudio();
+    j.lastPlay = p;
+    if (msg.engine === 'preview' && msg.previewUrl) {
+      if (j.loadedUrl !== msg.previewUrl) { previewEngine.load({ previewUrl: msg.previewUrl }); j.loadedUrl = msg.previewUrl; }
+      j.localPlay = { msg: p, engine: 'preview' };
+      previewEngine.playSynced(p.startMs, p.endMs, p.localAt, clockNow);
+    } else if (msg.engine === 'spotify' && msg.uri && phoneSpotifyReady()) {
+      j.localPlay = { msg: p, engine: 'spotify' };
+      spotifyEngine.load({ id: String(msg.uri).split(':').pop(), uri: msg.uri, durationMs: msg.durationMs || 0 });
+      spotifyEngine.playSynced(p.startMs, p.endMs, p.localAt, clockNow);
+    }
+    renderPhoneSound();
+    renderPlayerPlayback();
+  }
+
+  /** "Tap to enable sound": the tap allows audio; join the clip where the others are (if it's still on). */
+  function onEnableSound() {
+    var j = joined;
+    if (!j) return;
+    unlockAudio();
+    j.soundBlocked = false;
+    var p = j.lastPlay;
+    if (p && j.localPlay && j.localPlay.msg === p && clockNow() < p.localAt + (p.endMs - p.startMs) - 100) {
+      if (j.localPlay.engine === 'spotify') spotifyEngine.playSynced(p.startMs, p.endMs, p.localAt, clockNow);
+      else previewEngine.playSynced(p.startMs, p.endMs, p.localAt, clockNow);
+    }
+    renderPhoneSound();
+    renderPlayerPlayback();
+  }
+
+  // The phone's own engines (a phone never uses `player`).
+  [previewEngine, spotifyEngine].forEach(function (eng) {
+    eng.onState(function () { if (joined && joined.localPlay) renderPlayerPlayback(); });
+    eng.onEnded(function () { if (joined) renderPlayerPlayback(); });
+    eng.onError(function (msg, err) {
+      var j = joined;
+      if (!j || !j.localPlay) return;
+      var code = err && err.code;
+      if (code === 'blocked') j.soundBlocked = true;
+      else if (code === 'premium') { j.spDisabled = true; reportSpotifyReady(); toast('Full songs need Spotify Premium. You’ll hear the host’s device instead.', 6000); }
+      else if (code === 'signed-out') { reportSpotifyReady(); toast(msg, 6000); }
+      else toast(msg, 5000);
+      renderPhoneSound();
+      renderPlayerPlayback();
+    });
+  });
+
+  /**
+   * The small sound bar on a phone in a room: "Tap to enable sound" when the
+   * browser blocked it, and for full songs the Spotify sign-in / device on
+   * this phone (or that the host's device plays it).
+   */
+  function renderPhoneSound() {
+    var box = $('p-sound');
+    var j = joined;
+    var mode = phoneSoundMode();
+    var show = !!(j && j.view && j.status !== 'failed' && j.view.phase !== 'over' && (currentScreen === 'pturn' || currentScreen === 'pwait')) && mode !== 'host';
+    if (!show) { box.hidden = true; return; }
+    var neverTapped = !!(navigator.userActivation && !navigator.userActivation.hasBeenActive);
+    var enable = j.soundBlocked || (neverTapped && !previewEngine.unlocked);
+    var text = enable ? 'The browser blocked the sound on this phone.' : '';
+    var signin = false;
+    var devices = false;
+    if (mode === 'spotify') {
+      if (!spAuth.isSignedIn()) { text = 'Sound is playing on the host’s device (sign in with Spotify to hear it here).'; signin = true; enable = false; }
+      else if (j.spDisabled) { text = 'Full songs need Spotify Premium, so the sound plays on the host’s device.'; enable = false; }
+      else { devices = true; text = spCtl.deviceId() ? 'Full songs play on this phone’s Spotify device:' : 'Pick where this phone plays the songs (open Spotify on it, then Refresh):'; }
+    }
+    if (mode === 'spotify' && spAuth.isSignedIn() && !spReadyStarted) ensureSpotifyReady(); // lists this phone's devices
+    if (!text && !enable) { box.hidden = true; return; }
+    box.hidden = false;
+    $('p-sound-text').textContent = text;
+    $('p-sound-enable').hidden = !enable;
+    $('p-sp-signin').hidden = !signin;
+    $('p-sp-devices').hidden = !devices;
   }
 
   /** Remember the room this device plays in (localStorage), for rejoining after the tab is gone. */
@@ -1870,6 +2334,8 @@
     store.remove(STORE_JOIN);
     setUrlRoom('');
     cancelAnimationFrame(pbRaf);
+    stopPhoneAudio();
+    $('p-sound').hidden = true;
     banner('');
     keepAwake(false);
   }
@@ -1882,6 +2348,7 @@
     closed: 'The host closed the room',
     removed: 'You were removed from the room',
     'signaling-unreachable': 'Can’t reach the signaling server',
+    'ice-failed': 'Couldn’t connect to the host’s device',
     timeout: 'Couldn’t connect',
     'webrtc-unsupported': 'This browser can’t join rooms',
     version: 'Please reload',
@@ -1911,10 +2378,15 @@
       // game is in the background. Keep trying (Room.createPlayer, ~3 minutes).
       banner('');
       var own = d0(j).code === 'signaling-unreachable';
+      // The host answered but no network path between the two devices worked:
+      // not a sleeping host, so say what it really is.
+      var ice = d0(j).code === 'ice-failed';
+      var info = j.ctl.info();
       showWait({
         meta: 'Room ' + j.code + ' · ' + j.name,
-        title: own ? 'Can’t reach the connection server' : 'Waiting for the host’s screen to come back…',
+        title: own ? 'Can’t reach the connection server' : ice ? 'Couldn’t connect to the host’s device' : 'Waiting for the host’s screen to come back…',
         sub: own ? 'Check this phone’s internet connection (Wi-Fi or mobile data). Still trying…'
+          : ice ? (d0(j).message || Transport.MESSAGES['ice-failed']) + ' Still trying' + (info.relay ? ' (through a relay server this time)…' : '…')
           : 'Ask the host to open the game on their device and keep the screen on. You’ll join as soon as it’s back. (Wrong code? Leave and check it.)',
         spinner: true,
         actions: true,
@@ -1943,7 +2415,8 @@
       showWait({
         meta: 'Room ' + j.code,
         title: 'Reconnecting to the host…',
-        sub: 'If the host’s screen turned off or the game went to the background, ask them to open it again. The game continues where it left off.',
+        sub: d0(j).code === 'ice-failed' ? (d0(j).message || Transport.MESSAGES['ice-failed']) + ' The game continues where it left off.'
+          : 'If the host’s screen turned off or the game went to the background, ask them to open it again. The game continues where it left off.',
         spinner: true,
         actions: true,
         retry: false,
@@ -1975,7 +2448,7 @@
         meta: turnMeta(t),
         title: 'It’s ' + t.playerName + '’s turn',
         sub: t.playerLocal ? t.playerName + ' is playing on the host’s device.'
-          : t.playerOnline ? 'Listen along! The music plays on the host’s device.'
+          : t.playerOnline ? (phoneHears() ? 'Listen along! The clip plays on this phone too.' : 'Listen along! The music plays on the host’s device.')
           : t.playerName + ' is offline. The host can skip their turn.',
         spinner: false,
         clip: true,
@@ -2040,7 +2513,7 @@
     $('pt-choice').hidden = t.answerType !== 'choice';
     $('pt-free').hidden = t.answerType !== 'free';
     var notice = !t.playedOnce && (!j.playback || j.playback.status === 'idle')
-      ? 'Tap play: the song plays on the host’s device. Guess on this phone.' : '';
+      ? (phoneHears() ? 'Tap play: the song plays on every phone, this one included. Guess here.' : 'Tap play: the song plays on the host’s device. Guess on this phone.') : '';
     $('pt-notice').textContent = notice;
     $('pt-notice').hidden = !notice;
     renderPlayerTurnControls();
@@ -2063,30 +2536,54 @@
     $('pt-worth').appendChild(el('strong', { text: String(t.worth) }));
     $('pt-worth').appendChild(document.createTextNode(' points'));
     $('pt-play').disabled = j.pending;
-    $('pt-play').setAttribute('aria-label', busy ? 'Stop the song on the host’s device'
-      : 'Play the first ' + secondsText(t.extended ? clipTotal() : clipFirst()) + ' on the host’s device');
+    var where = phoneHears() ? ' on every device' : ' on the host’s device';
+    $('pt-play').setAttribute('aria-label', busy || localBusy(j) ? 'Stop the song' + where
+      : 'Play the first ' + secondsText(t.extended ? clipTotal() : clipFirst()) + where);
     $('pt-reveal').disabled = j.pending;
     $('pt-choice').querySelectorAll('.option').forEach(function (b) { b.disabled = j.pending; });
     $('pt-free').querySelectorAll('input, button').forEach(function (x) { x.disabled = j.pending; });
   }
 
-  // Clip progress on the phone: the host sends status changes and a position
-  // a few times a second; in between, the bar advances on the phone's clock.
+  /** Does this phone play the clips itself (sound on every device, and it can)? */
+  function phoneHears() {
+    var m = phoneSoundMode();
+    return m === 'preview' || (m === 'spotify' && phoneSpotifyReady());
+  }
+
+  /** Is this phone playing its own copy of the clip right now? */
+  function localBusy(j) {
+    var le = phoneEngine(j);
+    return !!(le && le.playing);
+  }
+
+  // Clip progress on the phone: from its own player while it plays the clip
+  // itself (sound on every device); otherwise the host sends status changes
+  // and a position a few times a second, and in between the bar advances on
+  // the phone's clock.
   var pbRaf = 0;
   function renderPlayerPlayback() {
     cancelAnimationFrame(pbRaf);
+    renderPhoneSound();
     var j = joined;
     if (!j || !j.view || !j.view.turn) return;
     var mine = currentScreen === 'pturn';
     if (!mine && currentScreen !== 'pwait') return;
     var t = j.view.turn;
     var pb = j.playback || { status: 'idle', pos: 0, heard: 0 };
-    var busy = pb.status === 'playing' || pb.status === 'loading';
+    var here = localBusy(j);
+    var lp = here ? j.localPlay.msg : null;
+    var busy = pb.status === 'playing' || pb.status === 'loading' || here;
     var cap = t.extended ? clipTotal() : clipFirst();
     var pre = mine ? 'pt-' : 'pw-';
-    var shown = busy ? pb.pos : pb.heard || 0;
+    var shown = pb.status === 'playing' || pb.status === 'loading' ? pb.pos : pb.heard || 0;
     if (pb.status === 'playing' && j.playbackAt) {
       shown = Math.min(pb.to || cap, pb.pos + (now() - j.playbackAt) / 1000);
+    }
+    var hereStarting = false;
+    if (here) {
+      var le = phoneEngine(j);
+      hereStarting = le.kind === 'preview' ? le.audio.paused : clockNow() < lp.localAt;
+      shown = Math.max(lp.from, Math.min(lp.to, lp.from + (le.positionMs() - lp.startMs) / 1000));
     }
     var short = Math.min(shown, clipFirst()) / clipFirst();
     var long = clipExtend() ? Math.max(0, Math.min(shown, clipTotal()) - clipFirst()) / clipExtend() : 0;
@@ -2095,8 +2592,9 @@
     $(pre + 'fill-long').style.width = (long * 100).toFixed(2) + '%';
     $(pre + 'seg-long').classList.toggle('locked', !t.extended);
     $(pre + 'time').textContent = Math.min(shown, clipTotal()).toFixed(1) + 's';
-    var extPart = clipExtend() > 0 && pb.from >= clipFirst() - 0.01;
-    var status = pb.status === 'loading' ? 'Loading on the host…'
+    var extPart = clipExtend() > 0 && (here ? lp.from : pb.from) >= clipFirst() - 0.01;
+    var status = here ? (hereStarting ? 'Starting…' : extPart ? 'Playing seconds ' + secs(clipFirst()) + '–' + secs(clipTotal()) : 'Playing on this phone…')
+      : pb.status === 'loading' ? 'Loading on the host…'
       : pb.status === 'playing' ? (extPart ? 'Playing seconds ' + secs(clipFirst()) + '–' + secs(clipTotal()) : 'Playing on the host…')
       : pb.status === 'blocked' || pb.status === 'error' ? (pb.message || 'The song couldn’t be played.')
       : !t.playedOnce ? (mine ? 'Tap play to hear ' + secondsText(clipFirst()) : 'Waiting for the song…')
@@ -2106,21 +2604,23 @@
     if (mine) {
       var btn = $('pt-play');
       btn.classList.toggle('playing', busy);
-      btn.classList.toggle('loading', pb.status === 'loading');
+      btn.classList.toggle('loading', pb.status === 'loading' || hereStarting);
       renderPlayerTurnControls();
     }
-    if (pb.status === 'playing') pbRaf = requestAnimationFrame(renderPlayerPlayback);
+    if (pb.status === 'playing' || here) pbRaf = requestAnimationFrame(renderPlayerPlayback);
   }
 
   function onPlayerPlayClick() {
     var j = joined;
     if (!j || j.pending) return;
+    unlockAudio(); // this tap lets the clip the host sends back make sound here
     var pb = j.playback || {};
-    var busy = pb.status === 'playing' || pb.status === 'loading';
+    var busy = pb.status === 'playing' || pb.status === 'loading' || localBusy(j);
     if (!j.ctl.act(busy ? 'stop' : 'play')) toast('Not connected to the host right now.');
   }
 
   function onPlayerExtendClick() {
+    unlockAudio();
     if (joined && !joined.ctl.act('extend')) toast('Not connected to the host right now.');
   }
 
@@ -2340,6 +2840,9 @@
     $('clip-first').addEventListener('change', renderClipSetting);
     $('clip-extra').addEventListener('change', renderClipSetting);
     // Sound: previews or full songs via Spotify.
+    document.querySelectorAll('input[name="sound-on"]').forEach(function (r) {
+      r.addEventListener('change', function () { if (r.checked) local.set(LOCAL_SOUND_ON, r.value === 'host' ? 'host' : 'all'); });
+    });
     document.querySelectorAll('input[name="engine"]').forEach(function (r) {
       r.addEventListener('change', function () {
         if (!r.checked) return;
@@ -2432,6 +2935,18 @@
           !window.confirm('Close the room? Players will be disconnected.')) return;
       goToSetup();
     });
+    // Sound on the phones: "Tap to enable sound", full songs via Spotify on this phone.
+    $('p-sound-enable').addEventListener('click', onEnableSound);
+    $('p-sp-signin').addEventListener('click', signIn);
+    $('p-sp-device').addEventListener('change', onDevicePicked);
+    $('p-sp-refresh').addEventListener('click', function () { if (!spReadyStarted) ensureSpotifyReady(); else refreshDevices(); });
+    // Any tap on a phone in a room allows its sound (clips arrive later without a tap).
+    ['click', 'keydown'].forEach(function (type) {
+      document.addEventListener(type, function () { if (joined && !previewEngine.unlocked && !previewEngine.playing) unlockAudio(); }, true);
+    });
+    $('diag').addEventListener('toggle', refreshDiag);
+    $('diag-copy').addEventListener('click', onDiagCopy);
+    if (DEBUG_LEVEL) $('diag').open = true;
     $('pt-play').addEventListener('click', onPlayerPlayClick);
     $('pt-extend').addEventListener('click', onPlayerExtendClick);
     $('pt-free').addEventListener('submit', onPlayerFreeSubmit);

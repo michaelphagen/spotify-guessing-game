@@ -268,7 +268,9 @@ test('snapshots never contain the current song before the guess is resolved', ()
       hearClip(host);
       transport.deliver(peer, act('extend'));
       host.playback({ status: 'playing', pos: 9, from: 5, to: 15 });
-      const before = JSON.stringify(transport.sent);
+      // Sound on every device: the preview URL goes out in `preload` / `play` only
+      // (it doesn't reveal the song; see the test below). Everything else stays clean.
+      const before = JSON.stringify(transport.sent.filter((s) => s.msg.type !== 'preload' && s.msg.type !== 'play'));
       assert.ok(transport.sent.length > 0);
       for (const secret of [t.previewUrl, t.image, 'cover', 'preview', 'trackId', '"outcome"', '"track"']) {
         assert.ok(!before.includes(secret), `${mode}: ${secret} leaked before the answer`);

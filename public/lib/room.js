@@ -10,14 +10,35 @@
  * or skipped). Multiple-choice options are sent to the player whose turn it is.
  *
  * Messages (every message carries v: PROTOCOL):
- *   player -> host  hello {name, token}
+ *   player -> host  hello {name, token, clockOffset?, rtt?, spotifyReady?}
  *                   play | stop | extend | answer {optionId | text} | reveal | next
- *                   sync                 "send me the current state again" (e.g. the
+ *                   sync {clockOffset?, rtt?, spotifyReady?}
+ *                                        "send me the current state again" (e.g. the
  *                                        phone's tab was in the background); answered
- *                                        with `state`, or error not-joined
+ *                                        with `state`, or error not-joined. Also how a
+ *                                        phone reports its clock offset and whether it
+ *                                        can play full songs itself (spotifyReady).
+ *                   ping {t0}            clock sync (allowed before hello)
  *   host -> player  state {state}      the sanitized snapshot for that player
- *                   playback {playback} clip status/progress while the host plays audio
+ *                   playback {playback} clip status/progress of the host's own player
+ *                   pong {t0, ht}      ht: the host's clock when the ping arrived
  *                   error {code, message}
+ *   "Sound plays on: every player's device" (settings.soundOn 'all') only:
+ *                   preload {engine, previewUrl?}   at the start of a turn: the song's
+ *                                        30-second preview URL (preview engine), so phones
+ *                                        can load it before Play is tapped
+ *                   play {seq, engine, startMs, endMs, from, to, extend, startAt, offset,
+ *                         previewUrl? | uri?, durationMs?, hostOnly}
+ *                                        play [startMs, endMs) of the song (ms of the audio
+ *                                        file) at host time startAt (a phone's local time =
+ *                                        startAt - its clock offset); from/to: the same
+ *                                        segment in clip seconds. uri only to phones that
+ *                                        reported spotifyReady (full songs); hostOnly: this
+ *                                        phone can't play it (the host's device does)
+ *                   halt {seq}           stop the clip (Stop, an answer, the next turn)
+ * The preview URL (a hash on Spotify's CDN) says nothing about the song, so it
+ * is sent in `preload` and `play` only; snapshots still never carry the current
+ * song's title, artist, cover, preview URL or URI before it is resolved.
  *
  * Shared by the browser (window.Room) and the Node tests.
  */
@@ -123,13 +144,15 @@
         // them to 30-second previews, see roomClip).
         clip: G.normalizeClip(cfg.settings && cfg.settings.clip),
         sourceUrl: (cfg.settings && cfg.settings.sourceUrl) || '',
-        // Host-only sound settings (never sent to phones): 'preview' (30-second
-        // previews) or 'spotify' (full songs via Spotify Connect), and the
-        // Spotify output device { id, name, local } chosen for it.
+        // Sound: 'preview' (30-second previews) or 'spotify' (full songs via
+        // Spotify Connect; phones only see settings.fullSongs), and the host's
+        // Spotify output device { id, name, local } (never sent to phones).
         engine: cfg.settings && cfg.settings.engine === 'spotify' ? 'spotify' : 'preview',
         device: cfg.settings && cfg.settings.device && cfg.settings.device.id
           ? { id: String(cfg.settings.device.id), name: String(cfg.settings.device.name || ''), local: !!cfg.settings.device.local }
           : null,
+        // "Sound plays on": 'all' (every player's device, the default) or 'host' (the host device only).
+        soundOn: normalizeSoundOn(cfg.settings && cfg.settings.soundOn),
       },
       source: cfg.source || null,
       tracks: cfg.tracks || [],
@@ -141,6 +164,15 @@
       turn: { playedOnce: false, heard: 0 },
       playback: idlePlayback(),
     };
+  }
+
+  function normalizeSoundOn(v) {
+    return v === 'host' ? 'host' : 'all';
+  }
+
+  /** Is the clip played on every player's device (not only the host's)? */
+  function soundEverywhere(room) {
+    return !!(room && room.settings && normalizeSoundOn(room.settings.soundOn) === 'all');
   }
 
   function idlePlayback() {
@@ -190,9 +222,23 @@
       peerId: extra.peerId || null,
       online: true,
       local: !!extra.local,
+      // Reported by the phone (hello / sync): can it play full songs itself, and its clock.
+      spotifyReady: false,
+      clockOffset: null,
+      rtt: null,
     };
     room.players.push(p);
     return p;
+  }
+
+  /** hello / sync: what a phone says about itself. */
+  function notePlayerInfo(p, msg) {
+    if (!p || !msg) return;
+    var off = Number(msg.clockOffset);
+    if (msg.clockOffset != null && isFinite(off) && Math.abs(off) < 1e13) p.clockOffset = Math.round(off);
+    var rtt = Number(msg.rtt);
+    if (msg.rtt != null && isFinite(rtt) && rtt >= 0 && rtt < 60000) p.rtt = Math.round(rtt);
+    if (typeof msg.spotifyReady === 'boolean') p.spotifyReady = msg.spotifyReady;
   }
 
   /**
@@ -455,6 +501,9 @@
         mode: g ? g.mode : room.settings.mode,
         rounds: room.settings.rounds || null,
         clipStart: room.settings.clipStart,
+        // Where the sound plays and with what (the Spotify device stays on the host).
+        soundOn: normalizeSoundOn(room.settings.soundOn),
+        fullSongs: room.settings.engine === 'spotify',
       },
       // Clip lengths (the host's settings are authoritative): labels and the progress split.
       clip: (function (c) { return { firstMs: c.firstMs, extendMs: c.extendMs }; })(roomClip(room)),
@@ -519,6 +568,70 @@
     return view;
   }
 
+  // ---------- Sound on every device: clock sync, preload, play ----------
+
+  /**
+   * Clock offset from ping/pong samples {t0, ht, t1} (t0/t1: the phone's clock
+   * when the ping left / the pong arrived; ht: the host's clock in between).
+   * The host's time is about local + offset. Uses the samples with the
+   * shortest round trips (the least queueing), averaged.
+   * @returns {{offset, rtt, n}} or null without usable samples
+   */
+  function estimateClockOffset(samples) {
+    var ok = (samples || []).filter(function (s) {
+      return s && isFinite(s.t0) && isFinite(s.t1) && isFinite(s.ht) && s.t1 >= s.t0;
+    }).map(function (s) { return { rtt: s.t1 - s.t0, offset: s.ht - (s.t0 + (s.t1 - s.t0) / 2) }; });
+    if (!ok.length) return null;
+    ok.sort(function (a, b) { return a.rtt - b.rtt; });
+    var best = ok.filter(function (s, i) { return i < 3 && s.rtt <= ok[0].rtt + 20; });
+    var sum = 0;
+    best.forEach(function (s) { sum += s.offset; });
+    return { offset: Math.round(sum / best.length), rtt: Math.round(ok[0].rtt), n: ok.length };
+  }
+
+  /**
+   * `preload` for the current song (turn start), or null: only with sound on
+   * every device, during an unanswered turn. Previews: the preview URL, which
+   * doesn't reveal the song. Full songs: no URI (the URI is the track id).
+   */
+  function preloadMessageFor(room) {
+    var g = room.game;
+    if (!soundEverywhere(room) || !g || g.phase !== 'round' || !g.current || g.current.answered) return null;
+    if (room.settings.engine === 'spotify') return message('preload', { engine: 'spotify' });
+    var t = G.trackById(g, g.current.trackId);
+    return t && t.previewUrl ? message('preload', { engine: 'preview', previewUrl: t.previewUrl }) : null;
+  }
+
+  /**
+   * The `play` a phone gets for a clip the host starts, or null (sound on the
+   * host only, a player on the host device). seg: { seq, engine, startMs, endMs,
+   * from, to, extend, startAt, previewUrl, uri, durationMs }. The Spotify URI
+   * only goes to phones that reported spotifyReady (signed in, with a device).
+   */
+  function playMessageFor(room, p, seg) {
+    if (!p || p.local || !soundEverywhere(room) || !seg) return null;
+    var engine = seg.engine === 'spotify' ? 'spotify' : 'preview';
+    var num = function (x) { x = Number(x); return isFinite(x) ? x : 0; };
+    var body = {
+      seq: num(seg.seq),
+      engine: engine,
+      startMs: Math.max(0, Math.round(num(seg.startMs))),
+      endMs: Math.max(0, Math.round(num(seg.endMs))),
+      from: num(seg.from),
+      to: num(seg.to),
+      extend: !!seg.extend,
+      startAt: num(seg.startAt),
+      offset: p.clockOffset != null ? p.clockOffset : null,
+    };
+    if (engine === 'preview' && seg.previewUrl) body.previewUrl = String(seg.previewUrl);
+    if (engine === 'spotify' && p.spotifyReady && seg.uri) {
+      body.uri = String(seg.uri);
+      if (num(seg.durationMs) > 0) body.durationMs = num(seg.durationMs);
+    }
+    body.hostOnly = engine === 'spotify' ? !body.uri : !body.previewUrl;
+    return message('play', body);
+  }
+
   /** Which screen a player's phone should show for a snapshot. */
   function playerScreen(view) {
     if (!view) return 'connecting';
@@ -538,6 +651,7 @@
    * @param {object} [opts.hooks]     onEffect(effect, actor), onChange(reason, detail)
    * @param {Function} [opts.rng]
    * @param {Function} [opts.now]
+   * @param {Function} [opts.clock]   the host clock for clock sync and `play` startAt (default: now)
    * @param {number} [opts.playbackIntervalMs]  min gap between progress updates while playing
    */
   function createHost(opts) {
@@ -546,9 +660,12 @@
     var hooks = opts.hooks || {};
     var rng = opts.rng;
     var now = opts.now || function () { return Date.now(); };
+    var clock = opts.clock || now;
     var interval = opts.playbackIntervalMs == null ? 250 : opts.playbackIntervalMs;
     var lastPlaybackSent = 0;
     var lastPlaybackStatus = null;
+    var playSeq = 0;
+    var lastSeg = null; // sound on every device: the clip playing now (for phones that (re)join mid-clip)
 
     function change(reason, detail) { if (hooks.onChange) hooks.onChange(reason, detail); }
 
@@ -568,11 +685,33 @@
       });
     }
 
+    function phones() {
+      return room.players.filter(function (p) { return p.peerId && p.online && !p.local; });
+    }
+
+    /** Sound on every device: the current song's `preload` to one phone, or to all. */
+    function sendPreload(peerId) {
+      var m = preloadMessageFor(room);
+      if (!m) return;
+      if (peerId) sendTo(peerId, m);
+      else phones().forEach(function (p) { sendTo(p.peerId, m); });
+    }
+
+    function broadcastHalt() {
+      lastSeg = null;
+      if (!soundEverywhere(room)) return;
+      phones().forEach(function (p) { sendTo(p.peerId, message('halt', { seq: playSeq })); });
+    }
+
     function run(actor, action) {
       var res = applyAction(room, actor, action, rng);
       if (!res.ok) return res;
+      var fx = res.effect && res.effect.type;
+      // The phones stop their own copy of the clip (the end of a clip needs no message).
+      if (fx === 'stop' || fx === 'answered' || fx === 'next' || fx === 'over') broadcastHalt();
       if (res.effect && hooks.onEffect) hooks.onEffect(res.effect, actor);
       broadcastState();
+      if (fx === 'next') sendPreload();
       change(action.type, { actor: actor, effect: res.effect });
       return res;
     }
@@ -583,19 +722,34 @@
         sendTo(peerId, errorMessage('version', 'This page is out of date with the host’s. Reload both pages.'));
         return;
       }
+      if (msg.type === 'ping') {
+        // Clock sync: answered at once, before hello too.
+        var t0 = Number(msg.t0);
+        if (isFinite(t0)) sendTo(peerId, message('pong', { t0: t0, ht: clock() }));
+        return;
+      }
       if (msg.type === 'hello') {
         var j = join(room, { peerId: peerId, name: msg.name, token: msg.token }, rng);
         if (!j.ok) { sendTo(peerId, errorMessage(j.code, j.message)); return; }
+        notePlayerInfo(j.player, msg);
         // An older tab still attached to this slot loses it.
         if (j.replacedPeer) sendTo(j.replacedPeer, errorMessage('replaced', j.player.name + ' joined from another tab or device.'));
         broadcastState();
+        sendPreload(peerId);
+        // A phone that (re)joins while a clip plays joins it where the others are.
+        if (lastSeg && soundEverywhere(room) && clock() < Number(lastSeg.startAt) + (lastSeg.endMs - lastSeg.startMs)) {
+          var pm = playMessageFor(room, j.player, lastSeg);
+          if (pm) sendTo(peerId, pm);
+        }
         change('join', { player: j.player, reclaimed: j.reclaimed });
         return;
       }
       var p = playerByPeer(room, peerId);
       if (!p) { sendTo(peerId, errorMessage('not-joined', 'Join the room first.')); return; }
       if (msg.type === 'sync') {
+        notePlayerInfo(p, msg);
         sendTo(peerId, message('state', { state: playerView(room, p.id) }));
+        change('info', { player: p });
         return;
       }
       var action = { type: msg.type, optionId: msg.optionId, text: msg.text };
@@ -618,9 +772,30 @@
       act: function (action) { return run('host', typeof action === 'string' ? { type: action } : action); },
       start: function (startOpts) {
         var res = startGame(room, Object.assign({ rng: rng }, startOpts || {}));
-        if (res.ok) { lastPlaybackStatus = null; broadcastState(); change('start'); }
+        if (res.ok) { lastPlaybackStatus = null; broadcastState(); sendPreload(); change('start'); }
         return res;
       },
+      /**
+       * Sound on every device: the host starts a clip (after a `play` or `extend`
+       * it accepted). seg: { engine, startMs, endMs, from, to, extend, startAt,
+       * previewUrl, uri, durationMs } (see playMessageFor). Each phone gets its
+       * own `play`. Returns the play's seq, or 0 (sound on the host only).
+       */
+      play: function (seg) {
+        if (!soundEverywhere(room)) return 0;
+        playSeq++;
+        var s = Object.assign({}, seg, { seq: playSeq });
+        lastSeg = s;
+        phones().forEach(function (p) {
+          var m = playMessageFor(room, p, s);
+          if (m) sendTo(p.peerId, m);
+        });
+        return playSeq;
+      },
+      /** Re-send the current song's preload (e.g. after switching to previews). */
+      preload: function () { sendPreload(); },
+      halt: broadcastHalt,
+      clock: clock,
       addLocalPlayer: function (name) {
         var res = addLocalPlayer(room, name);
         if (res.ok) { broadcastState(); change('players'); }
@@ -662,9 +837,14 @@
    * @param {string} opts.code
    * @param {string} opts.name
    * @param {string} [opts.token]
-   * @param {object} opts.hooks   onStatus(status, detail), onState(view), onPlayback(pb), onError(err), onToken(token)
+   * @param {object} opts.hooks   onStatus(status, detail), onState(view), onPlayback(pb), onError(err), onToken(token),
+   *                              onPlay(msg), onPreload(msg), onHalt(msg)   (sound on every device), onClock(clock)
    * @param {object} [opts.timers] { setTimeout, clearTimeout }
    * @param {Function} [opts.now]
+   * @param {Function} [opts.clock]         this device's clock for clock sync (default: now)
+   * @param {number} [opts.pingCount]       pings per clock-sync round (0: no clock sync; the app uses 5)
+   * @param {number} [opts.pingGapMs]       gap between them (150)
+   * @param {number} [opts.pingEveryMs]     a new round this often while connected (30000; 0 = only on connect)
    * @param {number} [opts.joinRetryMs]    gap between attempts while joining for the first time (4000)
    * @param {number} [opts.joinWaitMs]     how long to keep trying to join before failing (180000; 0 = one attempt)
    * @param {number} [opts.retryMs]        first delay before reconnecting after the host went away (1000),
@@ -677,8 +857,14 @@
    *   'connecting'    the first attempt
    *   'waiting'       not joined yet and the host doesn't answer; retrying every joinRetryMs
    *                   for joinWaitMs. detail.code: 'signaling-unreachable' (this phone's own
-   *                   network), or 'room-not-found' / 'timeout' / 'host-left' (the host's
-   *                   screen is off or the tab is in the background, or a wrong code)
+   *                   network), 'ice-failed' (the host answered, but no connection path
+   *                   between the two devices worked), or 'room-not-found' / 'timeout' /
+   *                   'host-left' (the host's screen is off or the tab is in the
+   *                   background, or a wrong code)
+   *
+   * makeTransport({relay}) gets relay: true after an attempt failed with
+   * 'ice-failed' (try TURN relays only), alternating with false on further ICE
+   * failures, so both paths keep being tried.
    *   'connected'
    *   'reconnecting'  was connected and lost the host (a reload, a background tab, Wi-Fi):
    *                   retrying with backoff, and at once on wake()
@@ -712,15 +898,79 @@
     var attempt = 0;
     var inFlight = false; // transport.connect() hasn't settled yet
     var joinStarted = 0;
+    var clock = opts.clock || now;
+    var pingCount = opts.pingCount == null ? 0 : opts.pingCount;
+    var pingGapMs = opts.pingGapMs == null ? 150 : opts.pingGapMs;
+    var pingEveryMs = opts.pingEveryMs == null ? 30000 : opts.pingEveryMs;
+    var samples = [];
+    var clockEst = null; // { offset, rtt, n, at }
+    var pingTimer = null;
+    var pingRound = 0;
+    var selfInfo = { spotifyReady: false };
+    // Diagnostics.
+    var attempts = 0;
+    var lastError = null;
+    var lastAttemptAt = 0;
+    var connectedAt = 0;
+    var lastDiag = null;
+    var relay = false;
+    var iceFailures = 0;
 
     function setStatus(s, detail) {
       status = s;
+      if (detail && detail.code) lastError = { code: detail.code, message: detail.message || '', at: now() };
       if (hooks.onStatus) hooks.onStatus(s, detail || null);
     }
 
     function closeTransport() {
-      if (transport) { try { transport.close(); } catch (e) { /* ignore */ } }
+      if (transport) {
+        try { if (transport.diag) lastDiag = transport.diag(); } catch (e) { /* ignore */ }
+        try { transport.close(); } catch (e) { /* ignore */ }
+      }
       transport = null;
+      if (pingTimer != null) timers.clearTimeout(pingTimer);
+      pingTimer = null;
+    }
+
+    /** What this phone tells the host about itself (hello / sync). */
+    function infoBody(isHello) {
+      var b = {};
+      // hello: only what is known (a phone without Spotify says nothing about it).
+      if (!isHello || selfInfo.spotifyReady) b.spotifyReady = !!selfInfo.spotifyReady;
+      if (clockEst) { b.clockOffset = clockEst.offset; b.rtt = clockEst.rtt; }
+      return b;
+    }
+
+    /** A clock-sync round: pingCount pings, then (if it changed) tell the host the offset. */
+    function pingRoundStart(t, my) {
+      if (pingTimer != null) timers.clearTimeout(pingTimer);
+      var round = ++pingRound;
+      var sent = 0;
+      (function next() {
+        pingTimer = null;
+        if (my !== attempt || round !== pingRound || transport !== t) return;
+        if (sent < pingCount) {
+          sent++;
+          try { t.send('host', message('ping', { t0: clock() })); } catch (e) { /* the leave handler retries */ }
+          pingTimer = timers.setTimeout(next, pingGapMs);
+          return;
+        }
+        // Give the last pong a moment, then settle.
+        pingTimer = timers.setTimeout(function () {
+          pingTimer = null;
+          if (my !== attempt || round !== pingRound || transport !== t) return;
+          var est = estimateClockOffset(samples.slice(-pingCount * 2));
+          if (est) {
+            var changed = !clockEst || Math.abs(est.offset - clockEst.offset) > 10 || !clockEst.sent;
+            clockEst = Object.assign(est, { at: now(), sent: clockEst && !changed ? clockEst.sent : false });
+            if (hooks.onClock) hooks.onClock(Object.assign({}, clockEst));
+            if (changed && status === 'connected') {
+              try { t.send('host', message('sync', infoBody(true))); clockEst.sent = true; } catch (e) { /* ignore */ }
+            }
+          }
+          if (pingEveryMs > 0) pingTimer = timers.setTimeout(function () { pingRoundStart(t, my); }, pingEveryMs);
+        }, Math.max(pingGapMs, 300));
+      })();
     }
 
     function clearTimers() {
@@ -742,6 +992,11 @@
     function scheduleRetry(err) {
       if (status === 'left' || status === 'failed') return;
       if (err && err.code === 'webrtc-unsupported') { stop('failed', err); return; }
+      if (err && err.code === 'ice-failed') {
+        // No path between the devices: try TURN relays only next (and alternate after that).
+        iceFailures++;
+        relay = !relay;
+      }
       attempt++;
       inFlight = false;
       clearTimers();
@@ -768,15 +1023,17 @@
     }
 
     function sendHello(t) {
-      try { t.send('host', message('hello', { name: opts.name, token: token })); } catch (e) { /* the leave handler retries */ }
+      try { t.send('host', message('hello', Object.assign({ name: opts.name, token: token }, infoBody(true)))); } catch (e) { /* the leave handler retries */ }
     }
 
     function connect() {
       closeTransport();
       clearTimers();
       var my = ++attempt;
+      attempts++;
+      lastAttemptAt = now();
       var t;
-      try { t = opts.makeTransport(); } catch (e) {
+      try { t = opts.makeTransport({ relay: relay }); } catch (e) {
         scheduleRetry({ code: (e && e.code) || 'transport', message: (e && e.message) || 'Couldn’t connect.' });
         return;
       }
@@ -795,11 +1052,24 @@
           everConnected = true;
           retries = 0;
           delay = 0;
-          if (status !== 'connected') setStatus('connected');
+          if (status !== 'connected') { connectedAt = now(); setStatus('connected'); }
           if (hooks.onState) hooks.onState(view);
         } else if (msg.type === 'playback' && msg.playback) {
           if (view) view.playback = msg.playback;
           if (hooks.onPlayback) hooks.onPlayback(msg.playback);
+        } else if (msg.type === 'pong') {
+          var t0 = Number(msg.t0);
+          var ht = Number(msg.ht);
+          if (isFinite(t0) && isFinite(ht)) {
+            samples.push({ t0: t0, ht: ht, t1: clock() });
+            if (samples.length > 40) samples.splice(0, samples.length - 40);
+          }
+        } else if (msg.type === 'play') {
+          if (hooks.onPlay) hooks.onPlay(msg);
+        } else if (msg.type === 'preload') {
+          if (hooks.onPreload) hooks.onPreload(msg);
+        } else if (msg.type === 'halt') {
+          if (hooks.onHalt) hooks.onHalt(msg);
         } else if (msg.type === 'error') {
           var err = { code: msg.code || 'error', message: msg.message || 'Something went wrong.' };
           if (FATAL_ERRORS.indexOf(err.code) !== -1) stop('failed', err);
@@ -816,6 +1086,7 @@
         if (my !== attempt) return;
         inFlight = false;
         sendHello(t);
+        if (pingCount > 0) pingRoundStart(t, my);
       }, function (err) {
         if (my !== attempt) return;
         inFlight = false;
@@ -828,7 +1099,7 @@
       var t = transport;
       var my = attempt;
       if (!t) return;
-      try { t.send('host', message('sync')); } catch (e) {
+      try { t.send('host', message('sync', infoBody(true))); } catch (e) {
         scheduleRetry({ code: 'host-left', message: 'Lost the connection to the host.' });
         return;
       }
@@ -860,7 +1131,12 @@
       wake: function (info) {
         if (status === 'idle' || status === 'left' || status === 'failed') return;
         if (transport && transport.wake) { try { transport.wake(info || null); } catch (e) { /* ignore */ } }
-        if (status === 'connected') { requestSync(); return; }
+        if (status === 'connected') {
+          requestSync();
+          // The clock may have jumped while the page slept.
+          if (info && info.resumed && transport && pingCount > 0) pingRoundStart(transport, attempt);
+          return;
+        }
         if (retryTimer == null || inFlight) return; // an attempt is under way
         delay = 0;
         connect();
@@ -874,6 +1150,40 @@
       status: function () { return status; },
       view: function () { return view; },
       token: function () { return token; },
+      /** Tell the host about this phone (spotifyReady); sent now if connected, else with the next hello. */
+      setInfo: function (info) {
+        var changed = false;
+        if (info && typeof info.spotifyReady === 'boolean' && info.spotifyReady !== selfInfo.spotifyReady) {
+          selfInfo.spotifyReady = info.spotifyReady;
+          changed = true;
+        }
+        if (changed && transport && status === 'connected') {
+          try { transport.send('host', message('sync', infoBody())); } catch (e) { /* ignore */ }
+        }
+        return changed;
+      },
+      /** The host's clock now, by this phone's estimate (null before the first clock sync). */
+      hostNow: function () { return clockEst ? clock() + clockEst.offset : null; },
+      clockInfo: function () { return clockEst ? { offset: clockEst.offset, rtt: clockEst.rtt, n: clockEst.n, at: clockEst.at } : null; },
+      /** Diagnostics: attempts, last error, timestamps and the transport's connection details. */
+      info: function () {
+        var d = null;
+        try { d = transport && transport.diag ? transport.diag() : lastDiag; } catch (e) { d = lastDiag; }
+        return {
+          status: status,
+          attempts: attempts,
+          lastError: lastError,
+          joinStartedAt: joinStarted,
+          lastAttemptAt: lastAttemptAt,
+          connectedAt: connectedAt,
+          relay: relay,
+          iceFailures: iceFailures,
+          clock: clockEst ? { offset: clockEst.offset, rtt: clockEst.rtt } : null,
+          transport: d,
+        };
+      },
+      /** The transport of the current attempt (for getStats), or null. */
+      transport: function () { return transport; },
     };
   }
 
@@ -938,7 +1248,11 @@
   function restoreRoom(saved, o) {
     var room = roomOf(saved, o);
     if (!room) return null;
-    room.players.forEach(function (p) { if (!p.local) { p.online = false; p.peerId = null; } });
+    room.players.forEach(function (p) {
+      if (!p.local) { p.online = false; p.peerId = null; }
+      p.spotifyReady = false; // said again by the phone's next hello
+    });
+    room.settings.soundOn = normalizeSoundOn(room.settings.soundOn);
     room.turn = room.turn && typeof room.turn === 'object' ? room.turn : { playedOnce: false, heard: 0 };
     room.playback = idlePlayback();
     room.playback.heard = Number(room.turn.heard) || 0;
@@ -1044,6 +1358,11 @@
     notePlayback: notePlayback,
     playerView: playerView,
     playerScreen: playerScreen,
+    soundEverywhere: soundEverywhere,
+    estimateClockOffset: estimateClockOffset,
+    preloadMessageFor: preloadMessageFor,
+    playMessageFor: playMessageFor,
+    notePlayerInfo: notePlayerInfo,
     createHost: createHost,
     createPlayer: createPlayer,
     RESUME_MAX_AGE_MS: RESUME_MAX_AGE_MS,
