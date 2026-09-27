@@ -8,21 +8,80 @@
 })(typeof self !== 'undefined' ? self : this, function () {
   'use strict';
 
-  var CLIP_SHORT = 5; // seconds heard first
-  var CLIP_LONG = 15; // seconds heard after "play next 10 seconds"
+  // Default clip lengths (seconds): the first clip, and the total after "play next 10 seconds".
+  // A game's own lengths are in game.clip ({ firstMs, extendMs }, see normalizeClip).
+  var CLIP_SHORT = 5;
+  var CLIP_LONG = 15;
   var POINTS = { short: 10, extended: 5 };
-  var MAX_CLIP_START = 15; // "random spot" offsets are 0..15s, so offset+15 always fits a 30s preview
+  var PREVIEW_SECONDS = 30; // Spotify's previews are 30 seconds long
+  var MAX_CLIP_START = PREVIEW_SECONDS - CLIP_LONG; // default "random spot" range: 0..15 s
+  // The setup screen's choices (seconds). Extra time 0 means there is no extension.
+  var FIRST_CLIP_CHOICES = [1, 2, 3, 5, 7, 10, 15, 20];
+  var EXTRA_TIME_CHOICES = [0, 5, 10, 15, 20, 30];
+  var DEFAULT_CLIP = Object.freeze({ firstMs: CLIP_SHORT * 1000, extendMs: (CLIP_LONG - CLIP_SHORT) * 1000 });
+  var MAX_CLIP_PART_MS = 60000;
+
+  // ---------- Clip lengths ----------
+
+  /**
+   * A clean { firstMs, extendMs }: missing or unusable values fall back to the
+   * defaults (5 s, then 10 s more), so games and rooms saved before clip lengths
+   * were configurable keep working. firstMs is 0.5-60 s; extendMs is 0-60 s
+   * (0: no extension).
+   */
+  function normalizeClip(clip) {
+    var c = clip && typeof clip === 'object' ? clip : {};
+    var first = Number(c.firstMs);
+    var ext = Number(c.extendMs);
+    first = isFinite(first) && first > 0 ? Math.min(MAX_CLIP_PART_MS, Math.max(500, Math.round(first))) : DEFAULT_CLIP.firstMs;
+    ext = c.extendMs != null && c.extendMs !== '' && isFinite(ext) && ext >= 0 ? Math.min(MAX_CLIP_PART_MS, Math.round(ext)) : DEFAULT_CLIP.extendMs;
+    return { firstMs: first, extendMs: ext };
+  }
+
+  /** A game's clip lengths (defaults for a game saved before they were configurable). */
+  function clipOf(game) {
+    return normalizeClip(game && game.clip);
+  }
+
+  /** First clip + extension, in seconds. */
+  function clipTotalSeconds(clip) {
+    var c = normalizeClip(clip);
+    return (c.firstMs + c.extendMs) / 1000;
+  }
+
+  /**
+   * Fit clip lengths to a preview (30 s): the first clip is never cut, but the
+   * extension is shortened so first + extension fits. `clamped` says whether it was.
+   * @returns {{ firstMs, extendMs, clamped: boolean }}
+   */
+  function fitClipToPreview(clip, previewSeconds) {
+    var c = normalizeClip(clip);
+    var limit = (previewSeconds > 0 ? previewSeconds : PREVIEW_SECONDS) * 1000;
+    var ext = Math.max(0, Math.min(c.extendMs, limit - c.firstMs));
+    return { firstMs: c.firstMs, extendMs: ext, clamped: ext !== c.extendMs };
+  }
+
+  /** The largest "random spot" offset (whole seconds) that fits a clip of `clipTotal` seconds in a preview. */
+  function maxClipStart(clipTotal, previewSeconds) {
+    var total = clipTotal > 0 ? clipTotal : CLIP_LONG;
+    return Math.max(0, Math.floor((previewSeconds > 0 ? previewSeconds : PREVIEW_SECONDS) - total));
+  }
 
   // ---------- Clip start (where in the preview the clip begins) ----------
 
   /**
    * Pick where a song's clip should start within its preview.
    * 'beginning' (or anything else) always starts at 0. 'random' picks a whole
-   * second in [0, MAX_CLIP_START] so the 15-second clip still fits a 30s preview.
+   * second in [0, max(0, 30 - clipTotal)] so the whole clip (first part plus
+   * extension, `clipTotal` seconds, default 15) still fits a 30s preview.
+   * @param {string} mode
+   * @param {Function} [rng]
+   * @param {number} [clipTotal]  seconds (default 15)
    */
-  function pickClipStart(mode, rng) {
-    rng = rng || Math.random;
-    if (mode === 'random') return Math.floor(rng() * (MAX_CLIP_START + 1));
+  function pickClipStart(mode, rng, clipTotal) {
+    if (typeof rng === 'number') { var t = rng; rng = clipTotal; clipTotal = t; }
+    rng = typeof rng === 'function' ? rng : Math.random;
+    if (mode === 'random') return Math.floor(rng() * (maxClipStart(clipTotal) + 1));
     return 0;
   }
 
@@ -30,12 +89,13 @@
    * Fit a clip start offset to the preview's actual duration. When the duration
    * isn't known yet (not finite/positive), the offset is returned unchanged —
    * previews are normally 30s, so this only matters once metadata has loaded.
-   * A preview too short to fit any 15-second clip falls back to 0.
+   * A preview too short to fit the whole clip (`clipTotal` seconds, default 15)
+   * falls back to 0.
    */
-  function clampClipStart(offset, duration) {
+  function clampClipStart(offset, duration, clipTotal) {
     offset = offset || 0;
     if (!isFinite(duration) || duration <= 0) return offset;
-    var maxStart = Math.floor(duration - CLIP_LONG);
+    var maxStart = Math.floor(duration - (clipTotal > 0 ? clipTotal : CLIP_LONG));
     if (maxStart <= 0) return 0;
     return Math.min(offset, maxStart);
   }
@@ -470,6 +530,7 @@
    * @param {string[]} [cfg.usedIds]  ids already played this session
    * @param {object} [cfg.source]
    * @param {'beginning'|'random'} [cfg.clipStartMode]
+   * @param {object} [cfg.clip]      { firstMs, extendMs } (default 5 s, then 10 s more)
    */
   function createGame(cfg) {
     var used = (cfg.usedIds || []).slice();
@@ -484,6 +545,7 @@
       sourceUrl: cfg.sourceUrl || '',
       mode: cfg.mode === 'free' ? 'free' : 'choice',
       clipStartMode: cfg.clipStartMode === 'random' ? 'random' : 'beginning',
+      clip: normalizeClip(cfg.clip),
       rounds: rounds,
       totalTurns: rounds ? rounds * players.length : null,
       players: players,
@@ -530,7 +592,7 @@
     if (game.mode === 'choice' && optionCount >= 2) {
       options = buildOptions(track, game.tracks, optionCount, rng, game.usedIds);
     }
-    var clipStart = pickClipStart(game.clipStartMode, rng);
+    var clipStart = pickClipStart(game.clipStartMode, rng, clipTotalSeconds(game.clip));
     game.current = { trackId: id, extended: false, options: options, answered: false, outcome: null, points: 0, guess: '', clipStart: clipStart };
     game.phase = 'round';
     return game.current;
@@ -605,7 +667,16 @@
     CLIP_SHORT: CLIP_SHORT,
     CLIP_LONG: CLIP_LONG,
     MAX_CLIP_START: MAX_CLIP_START,
+    PREVIEW_SECONDS: PREVIEW_SECONDS,
+    FIRST_CLIP_CHOICES: FIRST_CLIP_CHOICES,
+    EXTRA_TIME_CHOICES: EXTRA_TIME_CHOICES,
+    DEFAULT_CLIP: DEFAULT_CLIP,
     POINTS: POINTS,
+    normalizeClip: normalizeClip,
+    clipOf: clipOf,
+    clipTotalSeconds: clipTotalSeconds,
+    fitClipToPreview: fitClipToPreview,
+    maxClipStart: maxClipStart,
     pickClipStart: pickClipStart,
     clampClipStart: clampClipStart,
     basicNormalize: basicNormalize,

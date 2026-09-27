@@ -458,3 +458,95 @@ test('matchFreeAnswer reports what matched, and answer() records exact vs close 
   }
   assert.deepEqual(verdicts, { w: ['correct', 'exact', 10], b: ['correct', 'close', 10], c: ['wrong', 'none', 0] });
 });
+
+// ---------- Clip lengths ----------
+
+test('normalizeClip: defaults 5 + 10 s, keeps custom values, 0 extra time is allowed', () => {
+  assert.deepEqual(G.normalizeClip(), { firstMs: 5000, extendMs: 10000 });
+  assert.deepEqual(G.normalizeClip({}), { firstMs: 5000, extendMs: 10000 });
+  assert.deepEqual(G.normalizeClip({ firstMs: 3000, extendMs: 5000 }), { firstMs: 3000, extendMs: 5000 });
+  assert.deepEqual(G.normalizeClip({ firstMs: 10000, extendMs: 0 }), { firstMs: 10000, extendMs: 0 });
+  assert.deepEqual(G.normalizeClip({ firstMs: 'x', extendMs: -3 }), { firstMs: 5000, extendMs: 10000 }, 'garbage falls back');
+  assert.deepEqual(G.clipOf({}), { firstMs: 5000, extendMs: 10000 }, 'a game saved before clip lengths existed');
+  const game = G.createGame({ players: ['A'], mode: 'free', rounds: 0, tracks: [T('a', 'A', 'X')], clip: { firstMs: 2000, extendMs: 30000 } });
+  assert.deepEqual(game.clip, { firstMs: 2000, extendMs: 30000 });
+  assert.deepEqual(G.createGame({ players: ['A'], mode: 'free', rounds: 0, tracks: [T('a', 'A', 'X')] }).clip, { firstMs: 5000, extendMs: 10000 });
+});
+
+test('fitClipToPreview: shortens only the extra time so the clip fits 30 s', () => {
+  assert.deepEqual(G.fitClipToPreview({ firstMs: 5000, extendMs: 10000 }), { firstMs: 5000, extendMs: 10000, clamped: false });
+  assert.deepEqual(G.fitClipToPreview({ firstMs: 10000, extendMs: 20000 }), { firstMs: 10000, extendMs: 20000, clamped: false }, 'exactly 30 s fits');
+  assert.deepEqual(G.fitClipToPreview({ firstMs: 20000, extendMs: 20000 }), { firstMs: 20000, extendMs: 10000, clamped: true });
+  assert.deepEqual(G.fitClipToPreview({ firstMs: 20000, extendMs: 0 }), { firstMs: 20000, extendMs: 0, clamped: false });
+  assert.deepEqual(G.fitClipToPreview({ firstMs: 20000, extendMs: 5000 }, 22), { firstMs: 20000, extendMs: 2000, clamped: true }, 'custom preview length');
+  assert.deepEqual(G.fitClipToPreview({ firstMs: 20000, extendMs: 5000 }, 15), { firstMs: 20000, extendMs: 0, clamped: true }, 'the first clip is never cut');
+});
+
+test('pickClipStart with a custom clip length: random offsets fit 30 - total (fits, tight, zero extension)', () => {
+  const range = (total) => {
+    const rng = seeded(21);
+    const seen = new Set();
+    for (let i = 0; i < 400; i++) {
+      const off = G.pickClipStart('random', rng, total);
+      assert.ok(Number.isInteger(off), 'whole seconds');
+      seen.add(off);
+    }
+    return [Math.min(...seen), Math.max(...seen), seen.size];
+  };
+  assert.deepEqual(range(8).slice(0, 2), [0, 22], 'first 3 + extra 5: offset + 8 fits 30');
+  assert.deepEqual(range(10).slice(0, 2), [0, 20], 'first 10, no extra time');
+  assert.deepEqual(range(15).slice(0, 2), [0, 15], 'the default');
+  assert.deepEqual(range(30), [0, 0, 1], 'a 30 s clip always starts at 0');
+  assert.deepEqual(range(40), [0, 0, 1], 'longer than a preview: 0');
+  assert.equal(G.pickClipStart('beginning', seeded(1), 8), 0);
+  assert.equal(G.pickClipStart('random', () => 0.999999, 1), 29, 'a 1 s clip can start at 29 s');
+  assert.equal(G.pickClipStart('random', () => 0.999999), 15, 'default total is 15 s');
+  assert.equal(G.maxClipStart(8), 22);
+  assert.equal(G.maxClipStart(), 15);
+});
+
+test('clampClipStart with a custom clip length', () => {
+  assert.equal(G.clampClipStart(20, 30, 8), 20, 'fits: 20 + 8 <= 30');
+  assert.equal(G.clampClipStart(25, 30, 8), 22, 'clamped so offset + 8 fits');
+  assert.equal(G.clampClipStart(9, 30, 10), 9, 'zero extension: only the first clip must fit');
+  assert.equal(G.clampClipStart(9, 15, 10), 5);
+  assert.equal(G.clampClipStart(9, 20, 30), 0, 'preview shorter than the clip: start at 0');
+  assert.equal(G.clampClipStart(9, NaN, 8), 9, 'unknown duration: unchanged');
+  assert.equal(G.clampClipStart(9, 20), 5, 'default total 15 s');
+});
+
+test('startTurn picks random offsets that fit the game\'s clip lengths', () => {
+  const tracks = Array.from({ length: 40 }, (_, i) => T('t' + i, 'Song ' + i, 'X'));
+  const game = G.createGame({ players: ['A'], mode: 'free', rounds: 0, tracks, clipStartMode: 'random', clip: { firstMs: 20000, extendMs: 5000 }, rng: seeded(4) });
+  const rng = seeded(9);
+  G.startTurn(game, rng);
+  for (let i = 0; i < 30; i++) {
+    assert.ok(game.current.clipStart >= 0 && game.current.clipStart <= 5, 'offset + 25 fits 30: ' + game.current.clipStart);
+    G.answer(game, 'skip');
+    G.nextTurn(game, rng);
+  }
+});
+
+test('scoring with custom clip lengths stays 10 / 5', () => {
+  const tracks = Array.from({ length: 4 }, (_, i) => T('t' + i, 'Song ' + 'abcd'[i], 'X'));
+  const game = G.createGame({ players: ['A'], mode: 'free', rounds: 0, tracks, clip: { firstMs: 1000, extendMs: 30000 } });
+  G.startTurn(game);
+  G.answer(game, 'guess', G.trackById(game, game.current.trackId).title);
+  assert.equal(game.current.points, 10);
+  G.nextTurn(game);
+  game.current.extended = true;
+  G.answer(game, 'guess', G.trackById(game, game.current.trackId).title);
+  assert.equal(game.current.points, 5);
+});
+
+test('the setup screen offers the clip length choices of GameLogic', () => {
+  const html = require('fs').readFileSync(require('path').join(__dirname, '../public/index.html'), 'utf8');
+  const opts = (id) => {
+    const m = new RegExp('<select id="' + id + '"[^>]*>([\\s\\S]*?)</select>').exec(html);
+    return [...m[1].matchAll(/value="(\d+)"/g)].map((x) => Number(x[1]));
+  };
+  assert.deepEqual(opts('clip-first'), G.FIRST_CLIP_CHOICES);
+  assert.deepEqual(opts('clip-extra'), G.EXTRA_TIME_CHOICES);
+  assert.match(html, /<option value="5" selected>/);
+  assert.match(html, /<option value="10" selected>/);
+});

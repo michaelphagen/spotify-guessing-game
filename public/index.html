@@ -29,8 +29,8 @@
   <main id="app">
     <!-- SETUP -->
     <section id="screen-setup" class="screen" data-screen="setup">
-      <h1>Name that tune in 5 seconds</h1>
-      <p class="lede">Paste a Spotify playlist, pass the phone around (or play on everyone’s phones), and guess each song from its first five seconds.</p>
+      <h1>Name that tune in <span data-clip="first-s">5 seconds</span></h1>
+      <p class="lede">Paste a Spotify playlist, pass the phone around (or play on everyone’s phones), and guess each song from its first <span data-clip="first-s">5 seconds</span>.</p>
 
       <!-- A room this device hosted or played in recently (localStorage), filled by app.js -->
       <div class="resume-box" id="resume-box" hidden></div>
@@ -65,7 +65,39 @@
             <label><input type="radio" name="clip-start" value="beginning" checked><span>From the beginning</span></label>
             <label><input type="radio" name="clip-start" value="random"><span>Random spot</span></label>
           </div>
-          <p class="hint">"Random spot" plays 5 (then 10 more) seconds from a random point instead of the very start: anywhere in the song with full songs, or in the first half of the preview.</p>
+          <p class="hint" id="clip-start-hint">"Random spot" plays <span data-clip="first">5</span><span data-clip-extend-only> (then <span data-clip="extend">10</span> more)</span> seconds from a random point instead of the very start: anywhere in the song with full songs, or anywhere the whole clip fits in the 30-second preview.</p>
+        </fieldset>
+
+        <fieldset class="field">
+          <legend>Clip length</legend>
+          <div class="clip-lengths">
+            <div class="clip-length">
+              <label for="clip-first">First clip</label>
+              <select id="clip-first" name="clip-first">
+                <option value="1">1 second</option>
+                <option value="2">2 seconds</option>
+                <option value="3">3 seconds</option>
+                <option value="5" selected>5 seconds</option>
+                <option value="7">7 seconds</option>
+                <option value="10">10 seconds</option>
+                <option value="15">15 seconds</option>
+                <option value="20">20 seconds</option>
+              </select>
+            </div>
+            <div class="clip-length">
+              <label for="clip-extra">Extra time</label>
+              <select id="clip-extra" name="clip-extra">
+                <option value="0">None</option>
+                <option value="5">5 seconds</option>
+                <option value="10" selected>10 seconds</option>
+                <option value="15">15 seconds</option>
+                <option value="20">20 seconds</option>
+                <option value="30">30 seconds</option>
+              </select>
+            </div>
+          </div>
+          <p class="hint">Everyone hears the first clip; “Play next …” unlocks the extra time for fewer points.</p>
+          <p class="hint clip-fit-note" id="clip-fit-note" role="status" hidden></p>
         </fieldset>
 
         <fieldset class="field" id="sound-field">
@@ -134,8 +166,9 @@
       <details class="howto">
         <summary>How scoring works</summary>
         <ul>
-          <li>Guess after the first <strong>5 seconds</strong>: <strong>10 points</strong>.</li>
-          <li>Need more? Play the <strong>next 10 seconds</strong>; a correct guess is then worth <strong>5 points</strong>.</li>
+          <li>Guess after the first <strong data-clip="first-s">5 seconds</strong>: <strong>10 points</strong>.</li>
+          <li data-clip-extend-only>Need more? Play the next <strong data-clip="extend-s">10 seconds</strong>; a correct guess is then worth <strong>5 points</strong>.</li>
+          <li>Pick the lengths under <strong>Clip length</strong>. With previews, the whole clip has to fit the 30-second preview.</li>
           <li>Wrong answers and revealed answers score 0.</li>
           <li>No song is played twice in a session.</li>
         </ul>
@@ -200,7 +233,7 @@
       <p class="lede" id="pw-sub"></p>
       <div class="mini-clip" id="pw-clip" hidden>
         <div class="clip-bar" aria-hidden="true">
-          <div class="clip-seg clip-seg-short"><div class="clip-fill" id="pw-fill-short"></div></div>
+          <div class="clip-seg clip-seg-short" id="pw-seg-short"><div class="clip-fill" id="pw-fill-short"></div></div>
           <div class="clip-seg clip-seg-long" id="pw-seg-long"><div class="clip-fill" id="pw-fill-long"></div></div>
         </div>
         <div class="clip-labels"><span id="pw-time">0.0s</span><span class="muted" id="pw-status"></span></div>
@@ -220,13 +253,13 @@
       </div>
       <div id="pt-notice" class="notice" role="status" hidden></div>
       <div class="player-card">
-        <button type="button" class="play-btn" id="pt-play" aria-label="Play the first 5 seconds on the host’s device">
+        <button type="button" class="play-btn" id="pt-play" aria-label="Play the first clip on the host’s device">
           <svg class="icon-play" viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5v14l11-7z"/></svg>
           <svg class="icon-stop" viewBox="0 0 24 24" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="1.5"/></svg>
         </button>
         <div class="clip">
           <div class="clip-bar" aria-hidden="true">
-            <div class="clip-seg clip-seg-short"><div class="clip-fill" id="pt-fill-short"></div></div>
+            <div class="clip-seg clip-seg-short" id="pt-seg-short"><div class="clip-fill" id="pt-fill-short"></div></div>
             <div class="clip-seg clip-seg-long" id="pt-seg-long"><div class="clip-fill" id="pt-fill-long"></div></div>
           </div>
           <div class="clip-labels">
@@ -236,7 +269,7 @@
         </div>
       </div>
       <div class="row">
-        <button type="button" class="btn btn-ghost" id="pt-extend" disabled>Play next 10 seconds <span class="pill">5 pts</span></button>
+        <button type="button" class="btn btn-ghost" id="pt-extend" disabled>Play next <span data-clip="extend-s">10 seconds</span> <span class="pill">5 pts</span></button>
         <span class="worth" id="pt-worth"></span>
       </div>
       <div id="pt-choice" class="options" hidden></div>
@@ -268,18 +301,18 @@
       <p class="room-status" id="room-turn-status" hidden></p>
 
       <div class="player-card">
-        <button type="button" class="play-btn" id="play-btn" aria-label="Play the first 5 seconds">
+        <button type="button" class="play-btn" id="play-btn" aria-label="Play the first clip">
           <svg class="icon-play" viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5v14l11-7z"/></svg>
           <svg class="icon-stop" viewBox="0 0 24 24" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="1.5"/></svg>
         </button>
         <div class="clip">
           <div class="clip-bar" id="clip-bar" aria-hidden="true">
-            <div class="clip-seg clip-seg-short"><div class="clip-fill" id="fill-short"></div></div>
+            <div class="clip-seg clip-seg-short" id="seg-short"><div class="clip-fill" id="fill-short"></div></div>
             <div class="clip-seg clip-seg-long" id="seg-long"><div class="clip-fill" id="fill-long"></div></div>
           </div>
           <div class="clip-labels">
             <span id="clip-time">0.0s</span>
-            <span class="muted" id="clip-status">Tap play to hear 5 seconds</span>
+            <span class="muted" id="clip-status">Tap play to hear the first clip</span>
           </div>
         </div>
       </div>
@@ -291,7 +324,7 @@
       </div>
 
       <div class="row">
-        <button type="button" class="btn btn-ghost" id="extend-btn" disabled>Play next 10 seconds <span class="pill">5 pts</span></button>
+        <button type="button" class="btn btn-ghost" id="extend-btn" disabled>Play next <span data-clip="extend-s">10 seconds</span> <span class="pill">5 pts</span></button>
         <span class="worth" id="worth">Worth <strong>10</strong> points</span>
       </div>
 

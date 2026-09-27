@@ -49,10 +49,10 @@ function fakeTransport() {
 const hello = (name, token) => Room.message('hello', { name, token });
 const act = (type, body) => Room.message(type, body);
 
-function setup({ mode = 'choice', rounds = 2, names = ['Alice', 'Bob'], seed = 7 } = {}) {
+function setup({ mode = 'choice', rounds = 2, names = ['Alice', 'Bob'], seed = 7, clip, engine } = {}) {
   const room = Room.createRoom({
     code: 'ABCD',
-    settings: { mode, rounds, clipStart: 'random', sourceUrl: 'x' },
+    settings: { mode, rounds, clipStart: 'random', sourceUrl: 'x', clip, engine },
     source: { type: 'playlist', name: 'Hits', image: null, key: 'playlist:x' },
     tracks: TRACKS.map((t) => ({ ...t })),
   });
@@ -847,4 +847,97 @@ test('player: wake() while connected asks for a fresh state; no answer means a d
   assert.equal(p.ctl.status(), 'left');
   p.ctl.wake({});
   assert.equal(p.made.length, n + 1);
+});
+
+// ---------- Clip lengths ----------
+
+test('clipSegment follows the game\'s clip lengths (default 5 + 10 s, custom, no extra time)', () => {
+  const fresh = { extended: false };
+  const ext = { extended: true };
+  assert.deepEqual(Room.clipSegment(fresh, 'play'), { from: 0, to: 5 }, 'defaults when no lengths are given');
+  assert.deepEqual(Room.clipSegment(ext, 'play'), { from: 0, to: 15 });
+  assert.deepEqual(Room.clipSegment(fresh, 'extend'), { from: 5, to: 15 });
+  const c = { firstMs: 3000, extendMs: 5000 };
+  assert.deepEqual(Room.clipSegment(fresh, 'play', c), { from: 0, to: 3 });
+  assert.deepEqual(Room.clipSegment(ext, 'play', c), { from: 0, to: 8 });
+  assert.deepEqual(Room.clipSegment(fresh, 'extend', c), { from: 3, to: 8 });
+  const none = { firstMs: 10000, extendMs: 0 };
+  assert.deepEqual(Room.clipSegment(fresh, 'play', none), { from: 0, to: 10 });
+  assert.equal(Room.clipSegment(fresh, 'extend', none), null, 'no extra time: nothing to extend');
+});
+
+test('custom clip lengths: play/extend segments, progress cap, snapshot clip and messages', () => {
+  const { room, transport, host, effects } = setup({ clip: { firstMs: 3000, extendMs: 5000 }, engine: 'spotify' });
+  assert.deepEqual(transport.last('peer1', 'state').state.clip, { firstMs: 3000, extendMs: 5000 }, 'the lobby snapshot has the lengths');
+  host.start();
+  assert.deepEqual(room.game.clip, { firstMs: 3000, extendMs: 5000 });
+  const cur = currentPeer(room);
+  let v = transport.last(cur, 'state').state;
+  assert.deepEqual(v.clip, { firstMs: 3000, extendMs: 5000 }, 'phones get the lengths for labels and progress');
+  transport.deliver(cur, act('extend'));
+  assert.match(transport.last(cur).message, /first 3 seconds/);
+  transport.deliver(cur, act('play'));
+  assert.deepEqual(effects.pop(), { type: 'play', from: 0, to: 3, actor: Room.currentPlayer(room).id });
+  host.playback({ status: 'playing', pos: 1, from: 0, to: 3 });
+  host.playback({ status: 'stopped', pos: 4.5, from: 0, to: 3 });
+  assert.equal(room.turn.heard, 3, 'progress is capped at the first clip');
+  transport.deliver(cur, act('extend'));
+  assert.deepEqual(effects.pop(), { type: 'play', from: 3, to: 8, extend: true, actor: Room.currentPlayer(room).id });
+  host.playback({ status: 'playing', pos: 20, from: 3, to: 8 });
+  assert.equal(room.playback.pos, 8, 'extended: capped at first + extra time');
+  transport.deliver(cur, act('extend'));
+  assert.match(transport.last(cur).message, /extra 5 seconds are already unlocked/);
+  transport.deliver(cur, act('answer', { optionId: trackOf(room).id }));
+  assert.equal(transport.last(cur, 'state').state.result.points, 5, 'scoring is unchanged: 5 after the extension');
+});
+
+test('no extra time: extend is refused, only the 10-point path exists', () => {
+  const { room, transport, host, effects } = setup({ clip: { firstMs: 10000, extendMs: 0 } });
+  host.start();
+  const cur = currentPeer(room);
+  transport.deliver(cur, act('play'));
+  assert.deepEqual(effects.pop(), { type: 'play', from: 0, to: 10, actor: Room.currentPlayer(room).id });
+  host.playback({ status: 'stopped', pos: 10, from: 0, to: 10 });
+  transport.deliver(cur, act('extend'));
+  assert.equal(transport.last(cur).code, 'no-extension');
+  assert.equal(room.game.current.extended, false);
+  assert.deepEqual(transport.last(cur, 'state').state.clip, { firstMs: 10000, extendMs: 0 });
+  transport.deliver(cur, act('answer', { optionId: trackOf(room).id }));
+  assert.equal(transport.last(cur, 'state').state.result.points, 10);
+});
+
+test('previews: the extra time is shortened so the whole clip fits 30 s (and the host is told)', () => {
+  const { room, transport, host, effects } = setup({ clip: { firstMs: 20000, extendMs: 20000 } });
+  assert.deepEqual(room.settings.clip, { firstMs: 20000, extendMs: 20000 }, 'the settings keep what the host chose');
+  assert.deepEqual(transport.last('peer1', 'state').state.clip, { firstMs: 20000, extendMs: 10000 }, 'lobby: as the game will play it');
+  host.start();
+  assert.deepEqual(room.game.clip, { firstMs: 20000, extendMs: 10000 });
+  assert.ok(room.game.notes.some((n) => /30 seconds long, so the extra time is 10 seconds/.test(n)), room.game.notes.join(' | '));
+  assert.ok(room.game.current.clipStart === 0, 'random spot: a 30 s clip leaves no room in a 30 s preview');
+  hearClip(host, 20);
+  transport.deliver(currentPeer(room), act('extend'));
+  assert.deepEqual(effects.pop(), { type: 'play', from: 20, to: 30, extend: true, actor: Room.currentPlayer(room).id });
+  // Full songs: nothing is shortened.
+  const s2 = setup({ clip: { firstMs: 20000, extendMs: 20000 }, engine: 'spotify' });
+  s2.host.start();
+  assert.deepEqual(s2.room.game.clip, { firstMs: 20000, extendMs: 20000 });
+});
+
+test('saved rooms keep the clip lengths; rooms saved before they existed get 5 + 10 s', () => {
+  const { room, host } = setup({ clip: { firstMs: 7000, extendMs: 15000 }, engine: 'spotify' });
+  host.start();
+  const json = JSON.parse(JSON.stringify(Room.savedRoomEntry(room, { now: 1000, transport: 'peer' })));
+  const r = Room.restoreRoom(json, { now: 2000, transport: 'peer' });
+  assert.deepEqual(r.settings.clip, { firstMs: 7000, extendMs: 15000 });
+  assert.deepEqual(r.game.clip, { firstMs: 7000, extendMs: 15000 });
+  assert.deepEqual(Room.playerView(r, r.players[0].id).clip, { firstMs: 7000, extendMs: 15000 });
+
+  const old = JSON.parse(JSON.stringify(Room.savedRoomEntry(room, { now: 1000, transport: 'peer' })));
+  delete old.room.settings.clip;
+  delete old.room.game.clip;
+  const o = Room.restoreRoom(old, { now: 2000, transport: 'peer' });
+  assert.deepEqual(o.settings.clip, { firstMs: 5000, extendMs: 10000 });
+  assert.deepEqual(o.game.clip, { firstMs: 5000, extendMs: 10000 });
+  assert.deepEqual(Room.playerView(o, o.players[0].id).clip, { firstMs: 5000, extendMs: 10000 });
+  assert.deepEqual(Room.clipSegment(o.game.current, 'extend', o.game.clip), { from: 5, to: 15 });
 });

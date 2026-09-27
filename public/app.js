@@ -47,13 +47,57 @@
   var TRANSPORT_KIND = Transport.kindFromSearch(window.location.search);
 
   // Clip lengths: the first clip, and the extension unlocked by "play next ...
-  // seconds". Everything in this file reads them from here (in seconds via
-  // clipFirst() / clipTotal()), so a setting can change them in one place.
-  var CLIP = { firstMs: G.CLIP_SHORT * 1000, extendMs: (G.CLIP_LONG - G.CLIP_SHORT) * 1000 };
-  function clipFirst() { return CLIP.firstMs / 1000; }
-  function clipExtend() { return CLIP.extendMs / 1000; }
-  function clipTotal() { return (CLIP.firstMs + CLIP.extendMs) / 1000; }
+  // seconds" (0: none). They are chosen on the setup screen and stored in the
+  // game (game.clip, fitted to 30-second previews when those play), which is
+  // the single source of truth: everything in this file reads them through
+  // clip() (in seconds via clipFirst() / clipExtend() / clipTotal()). A phone
+  // in a room reads them from the host's snapshot (view.clip).
+  function clip() {
+    if (joined) return G.normalizeClip(joined.view && joined.view.clip);
+    if (game) return G.clipOf(game);
+    if (hosting) return Room.roomClip(hosting.room);
+    return G.normalizeClip(null);
+  }
+  function clipFirst() { return clip().firstMs / 1000; }
+  function clipExtend() { return clip().extendMs / 1000; }
+  function clipTotal() { var c = clip(); return (c.firstMs + c.extendMs) / 1000; }
   function secs(n) { return String(Math.round(n * 10) / 10); }
+  function secondsText(n) { return secs(n) + ' second' + (Number(secs(n)) === 1 ? '' : 's'); }
+
+  /**
+   * Put clip lengths into the text under `root`: elements marked
+   * data-clip="first" | "extend" | "total" get the number of seconds,
+   * "first-s" | "extend-s" | "total-s" the same with "second(s)", and
+   * data-clip-extend-only elements are hidden when there is no extra time.
+   */
+  function fillClipText(root, c) {
+    if (!root) return;
+    var v = { first: c.firstMs / 1000, extend: c.extendMs / 1000, total: (c.firstMs + c.extendMs) / 1000 };
+    root.querySelectorAll('[data-clip]').forEach(function (node) {
+      var k = node.getAttribute('data-clip');
+      var unit = /-s$/.test(k);
+      var n = v[k.replace(/-s$/, '')];
+      if (n == null) return;
+      node.textContent = unit ? secondsText(n) : secs(n);
+    });
+    root.querySelectorAll('[data-clip-extend-only]').forEach(function (node) { node.hidden = !c.extendMs; });
+  }
+
+  /** The progress bar's two parts in proportion to the clip lengths; no second part without extra time. */
+  function renderClipSplit(prefix, c) {
+    var short = $(prefix + 'seg-short');
+    var long = $(prefix + 'seg-long');
+    if (short) short.style.flexGrow = String(c.firstMs);
+    if (long) {
+      long.style.flexGrow = String(c.extendMs || 0);
+      long.hidden = !c.extendMs;
+    }
+  }
+
+  /** "5 s clip + 10 s extra" (lobby, setup). */
+  function clipSummary(c) {
+    return secs(c.firstMs / 1000) + ' s clip' + (c.extendMs ? ' + ' + secs(c.extendMs / 1000) + ' s extra' : ', no extra time');
+  }
 
   // ---------- Spotify sign-in and full-song playback (host only) ----------
 
@@ -210,7 +254,7 @@
   /**
    * Where the current song's clip starts, in ms into the audio, given the
    * audio's duration (NaN while unknown).
-   * Previews: the stored offset (0-15 s), fitted to the preview's real length
+   * Previews: the stored offset (0 to 30 s minus the whole clip), fitted to the preview's real length
    * (GameLogic.clampClipStart). Full songs: "from the beginning" is 0 ms of the
    * song; "random spot" is picked once per turn from the whole song
    * (ClipEngine.randomFullStartMs) as soon as its duration is known, and kept
@@ -222,15 +266,16 @@
     if (player.kind === 'spotify') {
       if (game.clipStartMode !== 'random') return 0;
       if (cur.fullStart == null && durationMs > 0) {
-        cur.fullStart = window.ClipEngine.randomFullStartMs(durationMs, CLIP.firstMs + CLIP.extendMs) / 1000;
+        cur.fullStart = window.ClipEngine.randomFullStartMs(durationMs, clipTotal() * 1000) / 1000;
         saveGame();
       }
       return (cur.fullStart || 0) * 1000;
     }
     var d = durationMs / 1000;
-    var off = G.clampClipStart(cur.clipStart, d);
+    var total = clipTotal();
+    var off = G.clampClipStart(cur.clipStart, d, total);
     // A full-song start (from an earlier Spotify turn) doesn't fit a preview.
-    if (!(isFinite(d) && d > 0)) off = Math.min(off, G.MAX_CLIP_START);
+    if (!(isFinite(d) && d > 0)) off = Math.min(off, G.maxClipStart(total));
     return off * 1000;
   }
   /** The current clip's offset in seconds (for clip-relative progress). */
@@ -512,6 +557,15 @@
     else if (game) game.engine = 'preview';
     player.use(previewEngine);
     $('round-device').hidden = true;
+    // A 30-second preview may be too short for the chosen clip: shorten the extra time.
+    var fit = game ? G.fitClipToPreview(game.clip) : null;
+    if (fit && fit.clamped) {
+      game.clip = { firstMs: fit.firstMs, extendMs: fit.extendMs };
+      game.clipClamped = true;
+      msg += ' ' + Room.previewFitNote(game.clip);
+      if (currentScreen === 'round' && game.current) { renderClipLabels(); renderExtendState(); renderProgress(turnUi.heard); }
+      if (hosting && hosting.ctl) hosting.ctl.broadcast();
+    }
     saveGame();
     if (!game || fallingBack) { toast(msg, 8000); return; }
     var g = game;
@@ -624,8 +678,33 @@
       mode: modeInput ? modeInput.value : 'choice',
       rounds: parseInt($('rounds-select').value, 10) || 0,
       clipStart: clipStartInput ? clipStartInput.value : 'beginning',
+      clip: readClipSetting(),
       engine: soundPref(),
     };
+  }
+
+  /** The clip lengths chosen on the setup screen ({ firstMs, extendMs }). */
+  function readClipSetting() {
+    var first = parseFloat($('clip-first').value);
+    var extra = parseFloat($('clip-extra').value);
+    return G.normalizeClip({ firstMs: first * 1000, extendMs: extra * 1000 });
+  }
+
+  /**
+   * Setup screen texts that depend on the clip lengths (heading, hints, rules),
+   * and a note when a 30-second preview can't hold the whole clip.
+   */
+  function renderClipSetting() {
+    var c = readClipSetting();
+    var preview = soundPref() !== 'spotify';
+    var fit = G.fitClipToPreview(c);
+    fillClipText($('screen-setup'), preview ? fit : c);
+    var note = $('clip-fit-note');
+    note.textContent = preview && fit.clamped
+      ? 'Previews are only ' + G.PREVIEW_SECONDS + ' seconds long, so the extra time will be ' +
+        (fit.extendMs ? secondsText(fit.extendMs / 1000) : 'off') + ' (full songs keep ' + secondsText(c.extendMs / 1000) + ').'
+      : '';
+    note.hidden = !note.textContent;
   }
 
   function applySetup(s) {
@@ -637,6 +716,14 @@
     if (s.rounds != null && sel.querySelector('option[value="' + s.rounds + '"]')) sel.value = String(s.rounds);
     var c = document.querySelector('input[name="clip-start"][value="' + (s.clipStart === 'random' ? 'random' : 'beginning') + '"]');
     if (c) c.checked = true;
+    // Clip lengths (a setup saved before they existed: 5 s, then 10 s more).
+    var cl = G.normalizeClip(s.clip);
+    [['clip-first', cl.firstMs, G.DEFAULT_CLIP.firstMs], ['clip-extra', cl.extendMs, G.DEFAULT_CLIP.extendMs]].forEach(function (x) {
+      var box = $(x[0]);
+      var v = String(x[1] / 1000);
+      box.value = box.querySelector('option[value="' + v + '"]') ? v : String(x[2] / 1000);
+    });
+    renderClipSetting();
   }
 
   function setupError(msg) {
@@ -792,16 +879,23 @@
   async function startFromSetup(setup, excludeUsed) {
     var songs = await loadSongs(setup, excludeUsed);
     if (!songs) return;
+    // Previews are 30 seconds: the extra time is shortened so the whole clip fits.
+    var fit = songs.engine === 'spotify' ? Object.assign(G.normalizeClip(setup.clip), { clamped: false }) : G.fitClipToPreview(setup.clip);
     game = G.createGame({
       players: setup.players,
       mode: songs.mode,
       rounds: setup.rounds,
       clipStartMode: setup.clipStart === 'random' ? 'random' : 'beginning',
+      clip: fit,
       tracks: songs.tracks,
       usedIds: songs.used,
       source: songs.source,
       sourceUrl: setup.url,
     });
+    if (fit.clamped) {
+      game.clipClamped = true;
+      songs.notes.push(Room.previewFitNote(game.clip));
+    }
     game.notes = songs.notes;
     game.engine = songs.engine;
     var key = songs.source.key;
@@ -895,6 +989,7 @@
     $('free-input').value = '';
     renderRoomTurn();
 
+    renderClipLabels();
     renderExtendState();
     renderProgress(turnUi.heard);
     onPlayerState('stopped');
@@ -902,16 +997,24 @@
     player.load(track);
   }
 
+  /** Round screen labels and progress split for this game's clip lengths. */
+  function renderClipLabels() {
+    var c = clip();
+    fillClipText($('screen-round'), c);
+    renderClipSplit('', c);
+  }
+
   function renderExtendState() {
     var cur = game.current;
+    var c = clip();
     $('seg-long').classList.toggle('locked', !cur.extended);
-    $('extend-btn').disabled = cur.extended || !turnUi.playedOnce;
-    $('extend-btn').hidden = cur.extended;
+    $('extend-btn').disabled = cur.extended || !turnUi.playedOnce || !c.extendMs;
+    $('extend-btn').hidden = cur.extended || !c.extendMs; // no extra time in this game: no button
     $('worth').textContent = '';
     $('worth').appendChild(document.createTextNode('Worth '));
     $('worth').appendChild(el('strong', { text: String(cur.extended ? G.POINTS.extended : G.POINTS.short) }));
     $('worth').appendChild(document.createTextNode(' points'));
-    $('play-btn').setAttribute('aria-label', 'Play the first ' + secs(cur.extended ? clipTotal() : clipFirst()) + ' seconds');
+    $('play-btn').setAttribute('aria-label', 'Play the first ' + secondsText(cur.extended ? clipTotal() : clipFirst()));
   }
 
   function renderProgress(t) {
@@ -920,7 +1023,7 @@
     turnUi.heard = Math.max(turnUi.heard, Math.min(t, cur.extended ? clipTotal() : clipFirst()));
     var shown = player.playing ? t : turnUi.heard;
     var short = Math.min(shown, clipFirst()) / clipFirst();
-    var long = Math.max(0, Math.min(shown, clipTotal()) - clipFirst()) / clipExtend();
+    var long = clipExtend() ? Math.max(0, Math.min(shown, clipTotal()) - clipFirst()) / clipExtend() : 0;
     $('fill-short').style.width = (short * 100).toFixed(2) + '%';
     $('fill-long').style.width = (long * 100).toFixed(2) + '%';
     $('clip-time').textContent = Math.min(shown, clipTotal()).toFixed(1) + 's';
@@ -944,7 +1047,7 @@
     else {
       if (turnUi.heard > 0) turnUi.playedOnce = true;
       status.textContent = !turnUi.playedOnce
-        ? 'Tap play to hear ' + secs(clipFirst()) + ' seconds'
+        ? 'Tap play to hear ' + secondsText(clipFirst())
         : cur.extended ? 'Tap play to hear all ' + secs(clipTotal()) + ' seconds again' : 'Tap play to hear it again';
       renderExtendState();
       renderProgress(turnUi.heard);
@@ -971,19 +1074,22 @@
     var cur = game.current;
     reloadAfterError();
     turnUi.heard = 0;
-    player.playSegment(0, cur.extended ? CLIP.firstMs + CLIP.extendMs : CLIP.firstMs, clipOffsetMs);
+    var c = clip();
+    player.playSegment(0, cur.extended ? c.firstMs + c.extendMs : c.firstMs, clipOffsetMs);
   }
 
   function onExtendClick() {
     var cur = game.current;
     if (cur.extended || cur.answered) return;
+    var c = clip();
+    if (!c.extendMs) return; // no extra time in this game
     if (hosting) { hostAct('extend'); return; }
     cur.extended = true;
     saveGame();
     renderExtendState();
     reloadAfterError();
     turnUi.heard = clipFirst();
-    player.playSegment(CLIP.firstMs, CLIP.firstMs + CLIP.extendMs, clipOffsetMs);
+    player.playSegment(c.firstMs, c.firstMs + c.extendMs, clipOffsetMs);
   }
 
   function submit(kind, value) {
@@ -1022,7 +1128,7 @@
     var title = { correct: (cur.match === 'close' ? 'Close enough! +' : 'Correct! +') + cur.points, wrong: 'Not quite', revealed: 'Answer revealed', skipped: 'Song skipped' }[cur.outcome];
     $('verdict-title').textContent = title;
     var sub = '';
-    if (cur.outcome === 'correct') sub = name + (cur.extended ? ' got it with the extra ' + secs(clipExtend()) + ' seconds.' : ' got it in ' + secs(clipFirst()) + ' seconds!');
+    if (cur.outcome === 'correct') sub = name + (cur.extended ? ' got it with the extra ' + secs(clipExtend()) + ' seconds.' : ' got it in ' + secondsText(clipFirst()) + '!');
     else if (cur.outcome === 'wrong') sub = cur.guess ? name + ' guessed “' + cur.guess + '”. No points.' : 'No points this time.';
     else sub = 'No points this time.';
     $('verdict-sub').textContent = sub;
@@ -1165,7 +1271,7 @@
     var room = Room.createRoom({
       code: Room.generateCode(),
       settings: {
-        mode: songs.mode, rounds: setup.rounds, clipStart: setup.clipStart, sourceUrl: setup.url,
+        mode: songs.mode, rounds: setup.rounds, clipStart: setup.clipStart, clip: setup.clip, sourceUrl: setup.url,
         engine: songs.engine, device: songs.engine === 'spotify' ? spCtl.selectedDevice() : null,
       },
       source: songs.source,
@@ -1430,7 +1536,7 @@
     $('lobby-source').textContent = '“' + srcName + '” · ' + room.tracks.length + ' songs · ' +
       (s.mode === 'free' ? 'Free answer' : 'Multiple choice') + ' · ' +
       (s.rounds ? s.rounds + ' round' + (s.rounds === 1 ? '' : 's') : 'until the songs run out') + ' · ' +
-      (s.clipStart === 'random' ? 'random spot' : 'from the beginning');
+      (s.clipStart === 'random' ? 'random spot' : 'from the beginning') + ' · ' + clipSummary(Room.roomClip(room));
     lobbyError('');
     renderLobbyPlayers();
     renderHostConn();
@@ -1946,16 +2052,19 @@
     var t = j.view.turn;
     var pb = j.playback || {};
     var busy = pb.status === 'playing' || pb.status === 'loading';
+    var c = clip();
+    fillClipText($('screen-pturn'), c);
+    renderClipSplit('pt-', c);
     $('pt-seg-long').classList.toggle('locked', !t.extended);
-    $('pt-extend').hidden = t.extended;
-    $('pt-extend').disabled = t.extended || !t.playedOnce || busy || j.pending;
+    $('pt-extend').hidden = t.extended || !c.extendMs; // no extra time in this game: no button
+    $('pt-extend').disabled = t.extended || !t.playedOnce || busy || j.pending || !c.extendMs;
     $('pt-worth').textContent = '';
     $('pt-worth').appendChild(document.createTextNode('Worth '));
     $('pt-worth').appendChild(el('strong', { text: String(t.worth) }));
     $('pt-worth').appendChild(document.createTextNode(' points'));
     $('pt-play').disabled = j.pending;
     $('pt-play').setAttribute('aria-label', busy ? 'Stop the song on the host’s device'
-      : 'Play the first ' + secs(t.extended ? clipTotal() : clipFirst()) + ' seconds on the host’s device');
+      : 'Play the first ' + secondsText(t.extended ? clipTotal() : clipFirst()) + ' on the host’s device');
     $('pt-reveal').disabled = j.pending;
     $('pt-choice').querySelectorAll('.option').forEach(function (b) { b.disabled = j.pending; });
     $('pt-free').querySelectorAll('input, button').forEach(function (x) { x.disabled = j.pending; });
@@ -1980,16 +2089,17 @@
       shown = Math.min(pb.to || cap, pb.pos + (now() - j.playbackAt) / 1000);
     }
     var short = Math.min(shown, clipFirst()) / clipFirst();
-    var long = Math.max(0, Math.min(shown, clipTotal()) - clipFirst()) / clipExtend();
+    var long = clipExtend() ? Math.max(0, Math.min(shown, clipTotal()) - clipFirst()) / clipExtend() : 0;
+    renderClipSplit(pre, clip());
     $(pre + 'fill-short').style.width = (short * 100).toFixed(2) + '%';
     $(pre + 'fill-long').style.width = (long * 100).toFixed(2) + '%';
     $(pre + 'seg-long').classList.toggle('locked', !t.extended);
     $(pre + 'time').textContent = Math.min(shown, clipTotal()).toFixed(1) + 's';
-    var extPart = pb.from >= clipFirst() - 0.01;
+    var extPart = clipExtend() > 0 && pb.from >= clipFirst() - 0.01;
     var status = pb.status === 'loading' ? 'Loading on the host…'
       : pb.status === 'playing' ? (extPart ? 'Playing seconds ' + secs(clipFirst()) + '–' + secs(clipTotal()) : 'Playing on the host…')
       : pb.status === 'blocked' || pb.status === 'error' ? (pb.message || 'The song couldn’t be played.')
-      : !t.playedOnce ? (mine ? 'Tap play to hear ' + secs(clipFirst()) + ' seconds' : 'Waiting for the song…')
+      : !t.playedOnce ? (mine ? 'Tap play to hear ' + secondsText(clipFirst()) : 'Waiting for the song…')
       : mine ? (t.extended ? 'Tap play to hear all ' + secs(clipTotal()) + ' seconds again' : 'Clip finished. Tap play to hear it again')
       : 'Clip finished';
     $(pre + 'status').textContent = status;
@@ -2045,7 +2155,7 @@
       skipped: 'Song skipped',
     }[r.outcome];
     var sub;
-    if (r.outcome === 'correct') sub = who + (r.extended ? ' got it with the extra ' + secs(clipExtend()) + ' seconds.' : ' got it in ' + secs(clipFirst()) + ' seconds!');
+    if (r.outcome === 'correct') sub = who + (r.extended ? ' got it with the extra ' + secs(clipExtend()) + ' seconds.' : ' got it in ' + secondsText(clipFirst()) + '!');
     else if (r.outcome === 'wrong') sub = r.guess ? who + ' guessed “' + r.guess + '”. No points.' : 'No points this time.';
     else sub = (mine ? '' : t.playerName + ': ') + 'No points this time.';
     $('verdict-sub').textContent = sub;
@@ -2227,6 +2337,8 @@
       refreshExcludeHint();
     });
     $('url-input').addEventListener('input', refreshExcludeHint);
+    $('clip-first').addEventListener('change', renderClipSetting);
+    $('clip-extra').addEventListener('change', renderClipSetting);
     // Sound: previews or full songs via Spotify.
     document.querySelectorAll('input[name="engine"]').forEach(function (r) {
       r.addEventListener('change', function () {
@@ -2234,6 +2346,7 @@
         setSoundPref(r.value);
         soundStatus('');
         renderSound();
+        renderClipSetting();
         if (r.value === 'spotify') ensureSpotifyReady();
       });
     });

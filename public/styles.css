@@ -168,8 +168,8 @@ select { appearance: none; background-image: linear-gradient(45deg, transparent 
 .clip { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 10px; }
 .clip-bar { display: flex; gap: 4px; height: 12px; }
 .clip-seg { position: relative; overflow: hidden; border-radius: 999px; background: var(--surface-2); }
-.clip-seg-short { flex: 5; }
-.clip-seg-long { flex: 10; }
+.clip-seg-short { flex: 5 1 0; }
+.clip-seg-long { flex: 10 1 0; } /* app.js sets both in proportion to the game's clip lengths */
 .clip-seg-long.locked { background: repeating-linear-gradient(45deg, var(--surface-2) 0 6px, #1b1f27 6px 12px); }
 .clip-fill { position: absolute; inset: 0 auto 0 0; width: 0; background: var(--accent); border-radius: inherit; }
 .clip-seg-long .clip-fill { background: var(--amber); }
@@ -348,3 +348,9 @@ select { appearance: none; background-image: linear-gradient(45deg, transparent 
 .device-row select { min-height: 40px; padding: 6px 34px 6px 12px; }
 #sp-client-id { color: var(--text); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 .sp-other-app { align-self: flex-start; }
+
+/* ---------- Clip length (setup) ---------- */
+.clip-lengths { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.clip-length { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.clip-length label { font-weight: 500; font-size: 0.85rem; color: var(--muted); }
+.clip-fit-note { color: var(--amber); }

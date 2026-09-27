@@ -105,7 +105,7 @@
   /**
    * @param {object} cfg
    * @param {string} cfg.code
-   * @param {object} cfg.settings   { mode, rounds, clipStart, sourceUrl, engine, device }
+   * @param {object} cfg.settings   { mode, rounds, clipStart, clip: { firstMs, extendMs }, sourceUrl, engine, device }
    * @param {object} cfg.source     { type, name, image, key }
    * @param {Array}  cfg.tracks
    * @param {string[]} [cfg.usedIds]
@@ -119,6 +119,9 @@
         mode: cfg.settings && cfg.settings.mode === 'free' ? 'free' : 'choice',
         rounds: cfg.settings && cfg.settings.rounds > 0 ? Math.floor(cfg.settings.rounds) : 0,
         clipStart: cfg.settings && cfg.settings.clipStart === 'random' ? 'random' : 'beginning',
+        // Clip lengths as chosen on the host's setup screen (the game may fit
+        // them to 30-second previews, see roomClip).
+        clip: G.normalizeClip(cfg.settings && cfg.settings.clip),
         sourceUrl: (cfg.settings && cfg.settings.sourceUrl) || '',
         // Host-only sound settings (never sent to phones): 'preview' (30-second
         // previews) or 'spotify' (full songs via Spotify Connect), and the
@@ -142,6 +145,19 @@
 
   function idlePlayback() {
     return { status: 'idle', pos: 0, heard: 0, from: 0, to: 0, extended: false, message: '' };
+  }
+
+  /**
+   * The clip lengths in use: the game's, or (in the lobby) the host's settings
+   * as the next game will use them. With previews (30 s) the extension is
+   * shortened so the whole clip fits (G.fitClipToPreview).
+   * @returns {{ firstMs, extendMs, clamped: boolean }}
+   */
+  function roomClip(room) {
+    if (room.game) return Object.assign(G.clipOf(room.game), { clamped: !!room.game.clipClamped });
+    var c = G.normalizeClip(room.settings && room.settings.clip);
+    if (room.settings && room.settings.engine === 'spotify') return Object.assign(c, { clamped: false });
+    return G.fitClipToPreview(c);
   }
 
   function phaseOf(room) {
@@ -265,11 +281,14 @@
     if (!room.players.length) return fail('no-players', 'Wait for at least one player to join.');
     var mode = room.settings.mode;
     if (mode === 'choice' && G.distinctTitleCount(room.tracks) < 2) mode = 'free';
+    room.settings.clip = G.normalizeClip(room.settings.clip);
+    var clip = room.settings.engine === 'spotify' ? room.settings.clip : G.fitClipToPreview(room.settings.clip);
     room.game = G.createGame({
       players: room.players.map(function (p) { return p.name; }),
       mode: mode,
       rounds: room.settings.rounds,
       clipStartMode: room.settings.clipStart,
+      clip: clip,
       tracks: room.tracks,
       usedIds: room.usedIds,
       source: room.source,
@@ -277,6 +296,10 @@
       rng: opts.rng,
     });
     room.game.notes = room.notes.slice();
+    if (clip.clamped) {
+      room.game.clipClamped = true;
+      room.game.notes.push(previewFitNote(room.game.clip));
+    }
     room.notes = [];
     resetTurn(room);
     G.startTurn(room.game, opts.rng);
@@ -285,10 +308,29 @@
     return { ok: true, game: room.game };
   }
 
-  /** Clip-relative segment for play/extend. */
-  function clipSegment(cur, kind) {
-    if (kind === 'extend') return { from: G.CLIP_SHORT, to: G.CLIP_LONG };
-    return { from: 0, to: cur.extended ? G.CLIP_LONG : G.CLIP_SHORT };
+  /** "Previews are 30 seconds long, so the extra time is 10 seconds." */
+  function previewFitNote(clip) {
+    var ext = clip.extendMs / 1000;
+    return 'Previews are ' + G.PREVIEW_SECONDS + ' seconds long, so the extra time is ' +
+      (ext > 0 ? ext + ' second' + (ext === 1 ? '' : 's') : 'off') + '.';
+  }
+
+  function secondsText(ms) {
+    var n = Math.round(ms / 100) / 10;
+    return n + ' second' + (n === 1 ? '' : 's');
+  }
+
+  /**
+   * Clip-relative segment (seconds) for play/extend, from the game's clip
+   * lengths ({ firstMs, extendMs }, default 5 s + 10 s). null for 'extend'
+   * when the game has no extra time.
+   */
+  function clipSegment(cur, kind, clip) {
+    var c = G.normalizeClip(clip);
+    var first = c.firstMs / 1000;
+    var total = (c.firstMs + c.extendMs) / 1000;
+    if (kind === 'extend') return c.extendMs > 0 ? { from: first, to: total } : null;
+    return { from: 0, to: cur && cur.extended ? total : first };
   }
 
   /**
@@ -327,15 +369,17 @@
 
     if (g.phase !== 'round' || !cur || cur.answered) return fail('not-now', 'This song has already been answered.');
     if (type === 'play') {
-      var seg = clipSegment(cur, 'play');
+      var seg = clipSegment(cur, 'play', g.clip);
       return { ok: true, effect: { type: 'play', from: seg.from, to: seg.to } };
     }
     if (type === 'stop') return { ok: true, effect: { type: 'stop' } };
     if (type === 'extend') {
-      if (cur.extended) return fail('not-now', 'The extra 10 seconds are already unlocked.');
-      if (!room.turn.playedOnce) return fail('not-now', 'Play the first 5 seconds first.');
+      var clip = G.clipOf(g);
+      if (!clip.extendMs) return fail('no-extension', 'There’s no extra time in this game.');
+      if (cur.extended) return fail('not-now', 'The extra ' + secondsText(clip.extendMs) + ' are already unlocked.');
+      if (!room.turn.playedOnce) return fail('not-now', 'Play the first ' + secondsText(clip.firstMs) + ' first.');
       cur.extended = true;
-      var ext = clipSegment(cur, 'extend');
+      var ext = clipSegment(cur, 'extend', clip);
       return { ok: true, effect: { type: 'play', from: ext.from, to: ext.to, extend: true } };
     }
     if (type === 'answer') {
@@ -367,7 +411,7 @@
    */
   function notePlayback(room, pb) {
     var cur = room.game && room.game.current;
-    var cap = cur && cur.extended ? G.CLIP_LONG : G.CLIP_SHORT;
+    var cap = clipSegment(cur, 'play', room.game && room.game.clip).to;
     var pos = Math.max(0, Math.min(Number(pb.pos) || 0, cap));
     if (pb.status === 'playing' || pb.status === 'stopped') room.turn.heard = Math.max(room.turn.heard, pos);
     if (pb.status === 'stopped' && room.turn.heard > 0) room.turn.playedOnce = true;
@@ -412,6 +456,8 @@
         rounds: room.settings.rounds || null,
         clipStart: room.settings.clipStart,
       },
+      // Clip lengths (the host's settings are authoritative): labels and the progress split.
+      clip: (function (c) { return { firstMs: c.firstMs, extendMs: c.extendMs }; })(roomClip(room)),
       // A single-track link's name is the song's title: keep it until the end.
       source: room.source ? { type: room.source.type, name: room.source.type === 'track' && phase !== 'over' ? 'a single song' : room.source.name } : null,
       turn: null,
@@ -896,6 +942,9 @@
     room.turn = room.turn && typeof room.turn === 'object' ? room.turn : { playedOnce: false, heard: 0 };
     room.playback = idlePlayback();
     room.playback.heard = Number(room.turn.heard) || 0;
+    // Saved before clip lengths were configurable: 5 s, then 10 s more.
+    room.settings.clip = G.normalizeClip(room.settings.clip);
+    if (room.game) room.game.clip = G.clipOf(room.game);
     room.usedIds = Array.isArray(room.usedIds) ? room.usedIds : [];
     room.notes = Array.isArray(room.notes) ? room.notes : [];
     return room;
@@ -978,6 +1027,9 @@
     generateToken: generateToken,
     message: message,
     createRoom: createRoom,
+    roomClip: roomClip,
+    clipSegment: clipSegment,
+    previewFitNote: previewFitNote,
     phaseOf: phaseOf,
     playerById: playerById,
     playerByPeer: playerByPeer,
